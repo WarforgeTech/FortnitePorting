@@ -481,6 +481,10 @@ grepping its `id` in `props-full.jsonl`, so the member list is never stored twic
 `scopes.tsv` columns are `scopeId, uefnPath, registryPrefix, theme, rowCount, sampleAssetName,
 verified, note` — the last carrying the operator's verbatim reason for a non-default status.
 
+A row may also carry **`reach`**, which appears only when one of its identities sits in a mount UEFN
+does not expose, and names the identities that still work (`"bp+sm"`) or `"none"` when there are
+none. See *Reachability* below.
+
 ## Picking the mesh: proxies are not the visual
 
 A blueprint usually names several static meshes and the first one is frequently a **shadow proxy** —
@@ -595,17 +599,18 @@ per row saying why.
 
 | file | raw bytes | gzip -9 |
 | --- | ---: | ---: |
-| `META.json` | 562 | 333 |
-| `atlas.md` | 37,367 | 11,706 |
-| `scopes.tsv` | 35,633 | 9,599 |
+| `META.json` | 598 | 343 |
+| `atlas.md` | 38,671 | 12,193 |
+| `scopes.tsv` | 36,219 | 9,768 |
 | `galleries.jsonl` | 550,684 | 68,902 |
-| `props-full.jsonl` | 18,483,308 | 1,822,768 |
+| `props-full.jsonl` | 18,516,957 | 1,824,998 |
 | `dump-report.log` | 206,805 | 20,385 |
-| **total** | **19,314,359** | **1,933,693** (whole dir, deflate) |
+| **total** | **19,349,934** | **1,936,489** (whole dir, deflate) |
 
-Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,314,359 raw, 3,743,517 → 1,933,693
-zipped. The mount sweep added ~7 KB to `scopes.tsv` (the new `note` column) and ~1.8 KB to
-`atlas.md`.
+Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,349,934 raw, 3,743,517 → 1,936,489
+zipped. The mount sweep and the reachability pass added ~8 KB to `scopes.tsv` (the `note` column),
+~3 KB to `atlas.md`, and ~34 KB to `props-full.jsonl` — the `reach` field is emitted on only the
+2,198 constrained rows, so 92% of rows pay nothing for it.
 
 ## Mount verification
 
@@ -651,28 +656,70 @@ Against the 273 scopes the dump generates: **35 verified / 7 missing / 231 unver
 | `fnspaceingestion` | `/FNSpaceIngestion` | 285 |
 | `darkv_meadow_comp` | `/DarkV_Meadow_Comp` | 265 |
 
-One row verbatim from `scopes.tsv` (tab-separated):
+One row verbatim from `scopes.tsv` (tab-separated, note column truncated here):
 
 ```
-suburban_composition	/Suburban_Composition	/Suburban_Composition		677	PPID_Suburban_Composition_BP_BlueHouse_BayWindow_A_BS_A_632fdff5	missing	find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope.
+suburban_composition	/Suburban_Composition	/Suburban_Composition		677	PPID_Suburban_Composition_BP_BlueHouse_BayWindow_A_BS_A_632fdff5	missing	Placement PROBED AND FAILED 2026-09-01: … find_assets returned 0 rows for this folder …
 ```
 
-**2,189 rows have a PPID under a missing mount.** The atlas gives them a dedicated section telling
-an agent not to search or capture at that path, to place by `ppid` instead (flagged as the route to
-try, not a guarantee — placement was never probed on these mounts specifically), and to look for a
-preview under the row's `sm` scope rather than its `sc`.
+### The placement probe, 2026-09-01
 
-That last point was measured rather than asserted: **806 of the 2,189 (37%) have an `sm` in a mount
-that is not itself missing.** The other 63% have no mesh at all or a mesh in another missing mount —
-for those there is no preview route and the agent places blind. An early draft of the atlas said "a
-missing PPID mount very often still has a perfectly capturable `sm`"; the measurement contradicted
-it, and the generator now emits the fraction instead of the adjective. `META.json` carries the same
-numbers under `scopeStatus`.
+The first version of this section said a PPID under a missing mount was "the route to try, not a
+guarantee — placement was never probed on these mounts specifically". It has now been probed and
+**it fails**: `add_to_scene_from_asset` on
+`/Suburban_Composition/…PPID_…BlueHouse_BayWindow…` returned **"Could not load asset at path"**.
+
+That kills the assumption the earlier wording rested on — that a PPID resolves an object path
+directly and so sidesteps the content browser. It does not, for a mount UEFN has never loaded. A
+`missing` mount blocks **every** identity under it, placement included.
+
+The probed row's `bp` is `/Suburban_Assets/…BP_…_C`, which is in the *paired* missing mount, and it
+resolved no mesh at all. So that row has no usable route by any identity — it is genuinely
+unavailable to creators this season. `Config/mount-verification.json` records the failure on both
+suburban mounts with `"placementProbed": "failed"`.
+
+### Reachability: the `reach` field
+
+The rule this produced is **reachability is per-identity — an identity works only if ITS OWN scope
+is not `missing`** — and it is now computed per row rather than left to the reader. `PropRow` gains
+a `reach` field:
+
+* **Absent** — nothing is blocked. The normal case, and absent precisely so it costs zero bytes on
+  the 92% of rows that are fine.
+* **A `+`-joined list** (`"bp+sm"`, `"sm"`, `"ppid"`) — something is blocked; these are the
+  identities that still work.
+* **`"none"`** — every identity sits in a missing mount. Unavailable by any route; do not attempt
+  placement.
+
+Measured on 42.00:
+
+| reach | rows | meaning |
+| --- | ---: | --- |
+| _(absent)_ | 24,422 | fully reachable |
+| `bp+sm` | 785 | PPID's mount is missing; blueprint and mesh still work |
+| `bp` | 35 | blueprint only |
+| `sm` | 21 | mesh only — previewable, not placeable by PPID |
+| `ppid` | 7 | placeable, but no preview route |
+| `ppid+bp` | 2 | placeable, no mesh preview |
+| **`none`** | **1,348** | **unavailable this season (5.1% of all rows)** |
+
+**1,348 is the honest "unavailable this season" number.** 850 rows are partially reachable. The
+unreachable rows come from three scopes only — `suburban_composition` (677, all of them, because
+its paired assets mount is missing too), `sw_a_comp` (386 of 520) and `fnspaceingestion` (285, all
+of them). `grep '"reach":"none"' props-full.jsonl` lists them. `META.json` carries the same three
+totals under `reachability`.
+
+The atlas leads its missing-mount section with the per-identity rule and the probe that established
+it, adds it to the hard-rules table (which is the first thing an agent reads), and tells the reader
+to check `reach` before attempting any of the four workflow steps. One caveat is stated there
+explicitly: `reach` rules routes **out**, it does not promise the rest work — an identity in an
+`unverified` mount is untested, not proven good.
 
 A row is counted against **every** mount it reaches — its PPID's, its blueprint's and its mesh's —
-not just its PPID's. Without that, neither hand-probed mount would appear in the table at all: a
-prop's PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in shared
-environment content (`/Game/Environments`), and it is the second one an agent scopes a search to.
+not just its PPID's. Without that, neither hand-probed mount would appear in the scope table at
+all: a prop's PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in
+shared environment content (`/Game/Environments`), and it is the second one an agent scopes a search
+to.
 
 ### Discrepancy in the sweep input
 
@@ -723,7 +770,15 @@ say the same thing twice.
 * **Five scopes captured grey.** Recorded as `find` with a note rather than `find+capture`, because
   an untextured render is plausibly an unloaded-material artefact rather than a bad asset — but
   nobody has confirmed which, so "preview quality unconfirmed" is the strongest claim available.
-* **`missing` is a statement about the mount, not about the props.** Placement by `ppid` under a
-  missing mount is expected to work — that is how `/Burd_Comp` behaves — but was never probed on the
-  seven missing mounts themselves. If it turns out not to, 2,189 rows are unreachable and the atlas
-  is currently telling agents to try anyway.
+* **The placement probe was one asset on one mount.** `/Suburban_Composition` refused a PPID
+  placement, and the per-identity rule generalises from that single observation to all seven missing
+  mounts. It is the right generalisation — a mount UEFN never loaded cannot serve any path under it
+  — but the other six were not individually probed.
+* **`reach` rules routes out, it does not certify the rest.** An identity in an `unverified` mount
+  is untested, not proven good, so a row with no `reach` field is "nothing known to be blocked"
+  rather than "known to work". With 231 scopes unverified, that gap is large.
+* **1,348 rows are unavailable this season and the dump still ships them.** They carry
+  `"reach":"none"` and the atlas says not to attempt placement, but they remain in `props-full.jsonl`
+  and will still match a grep. Filtering them out would hide assets that a later season may expose
+  again; flagging them is the more useful of the two, but a consumer that ignores `reach` will
+  cheerfully try to place something that cannot be placed.

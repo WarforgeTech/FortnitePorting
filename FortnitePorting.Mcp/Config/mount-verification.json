@@ -1,5 +1,5 @@
 {
-  "comment": "Hand-maintained plus swept. An entry belongs here ONLY after somebody drove the stock UEFN editor MCP against that mount and watched the result. 'status': verified = the editor answered for this path; missing = find_assets returned nothing, so the mount is not exposed in the content browser at all. 'verified' verbs: find = find_assets(folder_path) returned rows; capture = CaptureAssetImage rendered a TEXTURED image (a grey render is recorded as find-only with a note); place = add_to_scene_from_asset spawned an actor; resolve = a PPID placement auto-resolved to its creative prop BP. A mount absent from this file is reported unverified, which is the honest default - the dump can prove a path exists in the archive, never that UEFN will accept it.",
+  "comment": "Hand-maintained plus swept. An entry belongs here ONLY after somebody drove the stock UEFN editor MCP against that mount and watched the result. 'status': verified = the editor answered for this path; missing = find_assets returned nothing, so the mount is not exposed in the content browser at all. 'verified' verbs: find = find_assets(folder_path) returned rows; capture = CaptureAssetImage rendered a TEXTURED image (a grey render is recorded as find-only with a note); place = add_to_scene_from_asset spawned an actor; resolve = a PPID placement auto-resolved to its creative prop BP. 'placementProbed': 'failed' records a mount where placing a known asset was tried and refused - a missing mount blocks placement as well as search. A mount absent from this file is reported unverified, which is the honest default - the dump can prove a path exists in the archive, never that UEFN will accept it.",
   "mounts": [
     {
       "uefnPath": "/AlleyT_Comp",
@@ -302,13 +302,15 @@
       "uefnPath": "/Suburban_Assets",
       "status": "missing",
       "verified": [],
-      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+      "note": "Placement PROBED AND FAILED 2026-09-01: add_to_scene_from_asset on /Suburban_Composition/...PPID_...BlueHouse_BayWindow... returned \"Could not load asset at path\". A missing mount blocks placement too, not just search - this is the evidence for the per-identity reachability rule in atlas.md. find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope.",
+      "placementProbed": "failed"
     },
     {
       "uefnPath": "/Suburban_Composition",
       "status": "missing",
       "verified": [],
-      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+      "note": "Placement PROBED AND FAILED 2026-09-01: add_to_scene_from_asset on /Suburban_Composition/...PPID_...BlueHouse_BayWindow... returned \"Could not load asset at path\". A missing mount blocks placement too, not just search - this is the evidence for the per-identity reachability rule in atlas.md. find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope.",
+      "placementProbed": "failed"
     },
     {
       "uefnPath": "/SuperS_Comp",

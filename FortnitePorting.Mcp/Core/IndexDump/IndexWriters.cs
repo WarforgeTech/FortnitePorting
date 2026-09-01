@@ -36,6 +36,20 @@ public sealed record PropRow
     /// <summary>Scope id this row lives in; joins to scopes.tsv.</summary>
     [JsonPropertyName("sc")] public string? Sc { get; init; }
 
+    /// <summary>
+    /// Present ONLY when at least one of this row's identities sits in a known-missing mount, and
+    /// then it names the ones that do not ("bp+sm"). <see cref="Unreachable"/> means none do - that
+    /// asset cannot be reached by any route.
+    /// <para>
+    /// Absent is the normal case and means nothing is blocked, which is exactly why it is absent:
+    /// the field would otherwise cost bytes on tens of thousands of rows just to say "fine".
+    /// </para>
+    /// </summary>
+    [JsonPropertyName("reach")] public string? Reach { get; init; }
+
+    /// <summary>The value of <see cref="Reach"/> when no identity is usable at all.</summary>
+    public const string Unreachable = "none";
+
     /// <summary>Creative category, from the prop's own creative tags.</summary>
     [JsonPropertyName("cat")] public string? Cat { get; init; }
 
@@ -179,17 +193,24 @@ public static class IndexWriters
 
         // Built here rather than inline so the interpolated numbers do not wreck the paragraph's
         // line wrapping inside the raw string literal below.
-        var missingPercent = counts.RowsUnderMissingMount == 0
+        var unreachablePercent = counts.FullRows == 0
             ? 0
-            : counts.PreviewableUnderMissingMount * 100.0 / counts.RowsUnderMissingMount;
+            : counts.UnreachableRows * 100.0 / counts.FullRows;
 
-        var missingPreviewNote = counts.RowsUnderMissingMount == 0
-            ? "No row on this dump has a PPID under a missing mount."
-            : $"Measured on this dump: of the {counts.RowsUnderMissingMount:N0} rows whose PPID sits in a "
-              + $"missing mount, **{counts.PreviewableUnderMissingMount:N0} ({missingPercent:N0}%) have an "
-              + "`sm` in a mount that is not itself missing**, so a preview is reachable for those and "
-              + "for those only. The remainder have no mesh at all, or a mesh in another missing mount; "
-              + "for them there is no preview route and you place blind.";
+        var constrained = counts.PartiallyReachableRows + counts.UnreachableRows;
+
+        var missingPreviewNote = constrained == 0
+            ? "No row on this dump has an identity in a missing mount."
+            : $"Measured on this dump: **{constrained:N0} of {counts.FullRows:N0} rows have at least one "
+              + $"identity in a missing mount**. {counts.PartiallyReachableRows:N0} of those keep a usable "
+              + $"route and carry a `reach` field naming it; **{counts.UnreachableRows:N0} "
+              + $"({unreachablePercent:N1}% of all rows) keep none** and carry `\"reach\":\"none\"`. Every "
+              + "other row is unconstrained and has no `reach` field at all.";
+
+        var unreachableNote = counts.UnreachableRows == 0
+            ? "No row on this dump is fully unreachable."
+            : $"There are **{counts.UnreachableRows:N0}** such rows here - "
+              + $"`grep '\"reach\":\"none\"' props-full.jsonl` lists them.";
 
         builder.Append($"""
             # Fortnite creative asset atlas
@@ -207,7 +228,8 @@ public static class IndexWriters
             1. **Human words -> rows.** `grep -i hedge index/props-full.jsonl`. Every row carries
                `kw`, lowercase tokens from its display name, its gallery names, its theme and its
                creative tags, so plain English hits even when the asset is called
-               `BP_Helios_JuniperHedge_Straight`.
+               `BP_Helios_JuniperHedge_Straight`. **If the row has a `reach` field, read it first** -
+               it tells you which of the steps below are actually available for that asset.
             2. **Row -> scoped search.** Often unnecessary - the row already holds exact paths. When
                you want to browse siblings, take the folder half of the row's `bp` or `sm` (or its
                scope's UEFN path from `scopes.tsv`, joined on `sc`) and call
@@ -236,6 +258,7 @@ public static class IndexWriters
             | **`CaptureAssetImage` NEVER works on a PPID.** It works on `sm` and `bp` paths. | Use `sm` for the picture and `ppid` for the placement. They are different strings on purpose. |
             | **`GetAssetThumbnails` returns empty for unloaded plugin content.** Rendering is live-only. | Do not read an empty thumbnail result as "this asset does not exist". |
             | **Scope every `find_assets` call** with `folder_path`. | Verified working scoped, e.g. `folder_path='/Game/Environments', name='JuniperHedge'`. |
+            | **Reachability is per-identity.** An identity works only if its own scope is not `missing` - and a missing mount blocks **placement too**, not just search. | Probed 2026-09-01: placing a PPID under `/Suburban_Composition` returned "Could not load asset at path". Check the row's `reach` field before you try anything. |
 
             ## Sizes
 
@@ -269,18 +292,34 @@ public static class IndexWriters
 
             ### When a scope is `missing`
 
-            The mount is not in the content browser, so for a row whose `sc` names it:
+            **Reachability is per-identity. An identity works only if ITS OWN scope is not
+            `missing`.** A missing mount does not merely hide its assets from the content browser -
+            it makes every identity under it unusable, placement included.
 
-            * **Do not search or capture at that path.** `find_assets` will return nothing there and
-              `CaptureAssetImage` has nothing to render. An empty result is the mount being absent,
-              not the asset being absent.
-            * **Place it by its `ppid`.** Placement resolves an object path directly rather than
-              going through the browser - which is how a PPID under `/Burd_Comp` places. This has
-              not been probed on the missing mounts themselves, so treat it as the route to try
-              rather than a guarantee.
-            * **Look for the preview under the `sm`, not under `sc`.** A row's mesh and blueprint
-              usually live in a different mount from its PPID (often `/Game/Environments`), and that
-              mount has its own status. {missingPreviewNote}
+            This was probed on 2026-09-01, and it is why the rule is stated this strongly rather
+            than hedged: `add_to_scene_from_asset` on a PPID under `/Suburban_Composition` returned
+            **"Could not load asset at path"**. It did not place. The earlier assumption - that a
+            PPID resolves an object path directly and so sidesteps the browser - is wrong for a
+            mount UEFN has not loaded at all.
+
+            So, for any row:
+
+            * **Check each identity against its own scope**, not against the row's `sc`. A row's
+              `ppid`, `bp` and `sm` routinely live in three different mounts.
+            * **The `reach` field does this for you.** It appears only on rows where something is
+              blocked, and names the identities that still work (`"bp+sm"`, `"sm"`). No `reach`
+              field means nothing is blocked.
+            * **`"reach":"none"` means the asset is unavailable to creators this season.** Every
+              route into it is in a mount UEFN does not expose. **Do not attempt placement** - it
+              will fail the way the probe did. {unreachableNote}
+            * **Do not search or capture at a missing path.** `find_assets` returns nothing there
+              and `CaptureAssetImage` has nothing to render. An empty result is the mount being
+              absent, not the asset being absent.
+
+            {missingPreviewNote}
+
+            One caveat on reading `reach`: it rules routes **out**, it does not promise the rest
+            work. An identity in an `unverified` mount is untested, not proven good.
 
             | scope | UEFN path | theme | rows | verified | sample vocabulary |
             | --- | --- | --- | ---: | --- | --- |
@@ -325,9 +364,9 @@ public sealed record IndexCounts
     public required int Scopes { get; init; }
     public required int Failures { get; init; }
 
-    /// <summary>Rows whose PPID lives in a mount UEFN does not expose in its content browser.</summary>
-    public int RowsUnderMissingMount { get; init; }
+    /// <summary>Rows with at least one identity in a missing mount, but at least one still usable.</summary>
+    public int PartiallyReachableRows { get; init; }
 
-    /// <summary>How many of those still have a mesh in a mount that is not itself missing.</summary>
-    public int PreviewableUnderMissingMount { get; init; }
+    /// <summary>Rows where EVERY identity sits in a missing mount - unavailable by any route.</summary>
+    public int UnreachableRows { get; init; }
 }

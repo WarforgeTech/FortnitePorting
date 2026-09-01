@@ -147,10 +147,10 @@ public sealed class AssetIndexDumper(
             fullRows.Count(row => row.Bp is not null), fullRows.Count(row => row.Sm is not null),
             fullRows.Count(row => row.Sz is not null), phase.Elapsed.TotalSeconds);
 
-        // ---------------------------------------------------------------- P5: scopes
+        // ---------------------------------------------------------------- P5: scopes + reachability
         phase.Restart();
-        var scopes = BuildScopes(rows);
-        timings["P5 scopes"] = phase.Elapsed;
+        var mounts = MountMapper.Load(MountVerificationPath());
+        var scopes = BuildScopes(rows, mounts);
 
         var verifiedScopes = scopes.Count(scope => scope.Status is MountStatus.Verified);
         var missingScopes = scopes.Count(scope => scope.Status is MountStatus.Missing);
@@ -159,21 +159,20 @@ public sealed class AssetIndexDumper(
             .Select(scope => scope.ScopeId)
             .ToHashSet(StringComparer.Ordinal);
 
-        // Rows whose PPID sits in a mount the content browser does not expose. They still place;
-        // they just cannot be found or previewed at that path, which is worth saying out loud.
-        var underMissing = fullRows.Where(row => row.Sc is not null && missingScopeIds.Contains(row.Sc)).ToList();
+        // Reachability is per identity, and that is a measured rule rather than a cautious guess:
+        // placing the PPID of a row in a missing mount was probed on 2026-09-01 and FAILED with
+        // "Could not load asset at path". A missing mount does not merely hide an asset from the
+        // content browser - it makes every identity under it unusable, placement included.
+        fullRows = fullRows.Select(row => row with { Reach = ReachOf(row, missingScopeIds) }).ToList();
+        timings["P5 scopes"] = phase.Elapsed;
 
-        // ...and of those, how many can still be PREVIEWED, because their mesh lives in some other
-        // mount that is not itself missing. This is the difference between "awkward" and "blind",
-        // and it is a measured fraction rather than a reassuring adjective.
-        var previewableUnderMissing = underMissing.Count(row =>
-            row.Sm is not null &&
-            ScopeOf(row.Sm) is { } meshScope &&
-            !missingScopeIds.Contains(meshScope.ScopeId));
+        var unreachable = fullRows.Count(row => row.Reach == PropRow.Unreachable);
+        var partiallyReachable = fullRows.Count(row => row.Reach is not null && row.Reach != PropRow.Unreachable);
 
-        Log.Information("[INDEX] P5: {Total} scopes - {Verified} verified, {Missing} missing, {Unverified} unverified; {Rows:N0} rows have a PPID under a missing mount ({Previewable:N0} of them still have a mesh somewhere previewable)",
-            scopes.Count, verifiedScopes, missingScopes, scopes.Count - verifiedScopes - missingScopes,
-            underMissing.Count, previewableUnderMissing);
+        Log.Information("[INDEX] P5: {Total} scopes - {Verified} verified, {Missing} missing, {Unverified} unverified",
+            scopes.Count, verifiedScopes, missingScopes, scopes.Count - verifiedScopes - missingScopes);
+        Log.Information("[INDEX] Reachability: {Full:N0} rows fully reachable, {Partial:N0} partially ({Unreachable:N0} UNREACHABLE - every identity sits in a missing mount)",
+            fullRows.Count - unreachable - partiallyReachable, partiallyReachable, unreachable);
 
         // ---------------------------------------------------------------- P6: write
         phase.Restart();
@@ -199,8 +198,8 @@ public sealed class AssetIndexDumper(
             Galleries = galleryCount,
             Scopes = scopes.Count,
             Failures = failures.Count,
-            RowsUnderMissingMount = underMissing.Count,
-            PreviewableUnderMissingMount = previewableUnderMissing
+            PartiallyReachableRows = partiallyReachable,
+            UnreachableRows = unreachable
         };
 
         var gameVersion = loader.GameVersion ?? SafeUnrealVersion();
@@ -224,9 +223,13 @@ public sealed class AssetIndexDumper(
             {
                 verified = verifiedScopes,
                 missing = missingScopes,
-                unverified = scopes.Count - verifiedScopes - missingScopes,
-                rowsUnderMissingMount = underMissing.Count,
-                previewableUnderMissingMount = previewableUnderMissing
+                unverified = scopes.Count - verifiedScopes - missingScopes
+            },
+            reachability = new
+            {
+                fullyReachable = fullRows.Count - unreachable - partiallyReachable,
+                partiallyReachable,
+                unreachable
             },
             files = new
             {
@@ -410,6 +413,43 @@ public sealed class AssetIndexDumper(
     private static ScopeInfo? ScopeOf(string? uefnPath)
         => uefnPath is null ? null : MountMapper.ScopeFor(uefnPath, MountMapper.PackageHalf(uefnPath));
 
+    /// <summary>
+    /// Which of a row's three identities are NOT in a known-missing mount.
+    /// <para>
+    /// Null - the common case - means every identity the row has is usable, and costs no bytes in
+    /// the shipped file. A value names the survivors ("bp+sm"), and
+    /// <see cref="PropRow.Unreachable"/> means none of them survive: that asset cannot be reached
+    /// by any route this season.
+    /// </para>
+    /// <para>
+    /// "Not known-missing" is the honest reading. An unverified mount is untested, not proven good,
+    /// so this field rules routes OUT rather than promising the rest work.
+    /// </para>
+    /// </summary>
+    private static string? ReachOf(PropRow row, HashSet<string> missingScopeIds)
+    {
+        var usable = new List<string>(3);
+        var blocked = false;
+
+        void Check(string label, string? path)
+        {
+            if (path is null) return;
+
+            // An unmappable path is unknown, not blocked - it must not fake an unreachable row.
+            if (ScopeOf(path) is not { } scope) return;
+
+            if (missingScopeIds.Contains(scope.ScopeId)) blocked = true;
+            else usable.Add(label);
+        }
+
+        Check("ppid", row.Ppid);
+        Check("bp", row.Bp);
+        Check("sm", row.Sm);
+
+        if (!blocked) return null;
+        return usable.Count == 0 ? PropRow.Unreachable : string.Join('+', usable);
+    }
+
     private async Task<List<BuiltRow>> BuildPropRowsAsync(
         IndexDumpOptions options,
         IReadOnlyList<CategoryItem> items,
@@ -574,7 +614,7 @@ public sealed class AssetIndexDumper(
     /// verified scopes out of the table entirely.
     /// </para>
     /// </summary>
-    private static List<ScopeRow> BuildScopes(List<BuiltRow> rows)
+    private static List<ScopeRow> BuildScopes(List<BuiltRow> rows, MountMapper mapper)
     {
         var byScope = new Dictionary<string, List<(BuiltRow Row, ScopeInfo Scope)>>(StringComparer.Ordinal);
         foreach (var row in rows)
@@ -583,8 +623,6 @@ public sealed class AssetIndexDumper(
             if (!byScope.TryGetValue(scope.ScopeId, out var list)) byScope[scope.ScopeId] = list = [];
             list.Add((row, scope));
         }
-
-        var mapper = MountMapper.Load(MountVerificationPath());
 
         return byScope
             .Select(pair =>
