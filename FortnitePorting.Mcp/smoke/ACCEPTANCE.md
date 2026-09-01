@@ -359,3 +359,68 @@ file is also folded into `files[]` so `fileCount` stays truthful.
   not pasted into a prompt — read `primaryMesh` and `meshes[].materials[].textures[]` and ignore the rest.
 * **1x1 placeholder textures are flagged, not skipped.** Each texture entry carries `bytes` and
   `placeholder: true` under 512 bytes; the exporter still writes them.
+
+---
+
+# Manifest schema v2 — channel semantics and build stamp (2026-08-31, later same day)
+
+Four asks from the UEFN round-2 validation (`FortniteAssetExports/_uefn_staging/_validation/RESULTS.md`
+§19). That round proved empirically that a consumer cannot safely infer Fortnite's texture conventions
+from the manifest as it stood: mis-reading an `_S` map as R=ambient-occlusion darkened three assets by
+0.31–0.72x, and the opacity channel of a foliage mask had to be found by dumping channels by hand.
+`schemaVersion` is now **2**.
+
+## What changed
+
+| Ask | Field | Rule |
+|---|---|---|
+| Channel semantics | `meshes[].materials[].textures[].channelSemantics` | `SpecularMasks`/`_S` family → `{R:Specular, G:Metallic, B:Roughness}`; foliage `MaskTexture`/`_M` family → `{R:OpacityMask, G:Shading}`. Matched on **parameter name** (trailing `_2`/`_3` layer index stripped), omitted entirely for anything else. |
+| Opacity channel | `meshes[].materials[].opacityChannel` | `"R"`, emitted only when the material carries `opacity_in_mask_texture` **and** its mask-role parameter is the foliage family. A `SpecularMasks` map carries no opacity, so it gets the note and no channel rather than a wrong one. |
+| hex is sRGB | `hexEncoding: "sRGB"` beside every `hex`, plus root `schemaNotes.hex` | Chose annotation over emitting a second `hexLinear`: the linear values are already there as `r`/`g`/`b`, so a second encoding would be a third thing to get wrong. |
+| Layer disambiguation | `distinctTextureFiles` + `layers_share_textures` note | Emitted for a material the name calls layered (`layered_material_N`) **or** one whose parameters carry a numbered layer set (`Diffuse_Texture_2`…). The note fires when every diffuse layer names one file. |
+| Build stamp | `generator` (now an object) + `get_status.server` | `StampBuild` MSBuild target writes `AssemblyMetadata("BuildTimestampUtc")` and `("GitCommit")`; `McpServerInfo.BuildStamp` renders them. |
+
+Root `schemaNotes` documents each of the above; `guidance` was corrected — it previously stated the
+round-1 packing (`B=ambient occlusion`), which is exactly the error round 2 disproved.
+
+## Verification (all against the freshly published exe, commit ffe69f1843)
+
+* `--selftest` **PASSED in 5.7s**, 12 tools registered.
+* `get_status` → `server: { version 1.0.0, buildTimestampUtc "2026-09-01T03:44:02Z", gitCommit
+  "ffe69f1843", buildStamp "fortnite-porting 1.0.0, commit ffe69f1843, built 2026-09-01T03:44:02Z",
+  manifestSchemaVersion 2 }`. A stale publish now shows itself before an export, not after.
+* Re-exported ApolloBigBush, ApolloHedgeCube, DojoGateWall, GreenhouseWall — all four manifests
+  `schemaVersion: 2` with the same generator stamp.
+* **channelSemantics**: `SpecularMasks`, `_2`, `_3`, `_4` on DojoGateWall and `_1`–`_3` on
+  GreenhouseWall all carry `{R:Specular, G:Metallic, B:Roughness}`; `MaskTexture` on all three
+  BigBush materials and on `CP_MI_Apollo_Bush` carries `{R:OpacityMask, G:Shading}`. Nothing else
+  is annotated — `Diffuse`, `Normals`, `ColorPalette`, `Position`, `X-Axis` and, deliberately,
+  `MaskTexture_OpaqueCanopy` (a canopy layer whose packing was never measured) are all left bare.
+* **opacityChannel R** on `M_BigBush`, `CP_M_BigBush` and `CP_MI_Apollo_Bush` — the three materials
+  flagged `opacity_in_mask_texture`. Absent on every opaque material.
+* **Layer disambiguation**: GreenhouseWall `MI_LabRat_Wall_3layer_Inst` →
+  `distinctTextureFiles: 3` across 9 parameters + `layers_share_textures`, which is the manifest
+  finally saying in one field what §17 needed a channel investigation to establish. DojoGateWall
+  `MI_Asteria_Dojo_Wall_B` → `distinctTextureFiles: 9` across 12 parameters and **no** share note:
+  its layers are genuinely distinct.
+* **hexEncoding**: 284 `hex` fields across the four v2 manifests, 0 without `hexEncoding`.
+  `Color1_Base` reads `7C813A` / linear `0.20156, 0.21953, 0.04231` — the exact 2.4x trap from §14,
+  now labelled at the point of use.
+
+## Left open
+
+* **The mapping is a convention, not a read of the source graph.** It is keyed on parameter names
+  that were measured in one validation set. An unfamiliar packing gets no `channelSemantics` rather
+  than a guess, so absence means "unknown", never "no semantics".
+* **`MaskTexture_OpaqueCanopy` and other suffixed variants are not annotated.** Only a trailing
+  numeric layer index (`_2`, `_3`) is stripped before matching; a named variant is treated as a
+  different, unmeasured family.
+* **`distinctTextureFiles` counts files, not blend behaviour.** Round-2 ask #3 also wanted the layer
+  *mask* source (vertex colour channel / height map); the export does not carry it, so a consumer
+  still cannot tell how the layers combine — only whether combining them could matter.
+* **Asks #2 (`role: primary|layer2|canopy`) and #4 (`reads_vertex_color`) are not implemented.**
+* **`generator` changed from string to object.** That is a breaking read for a v1 consumer, which is
+  what the `schemaVersion` bump is for.
+* **Every build recompiles this project**, because the stamp target rewrites the generated
+  AssemblyInfo each time. Intentional: an exe that reports a build time it did not have would defeat
+  the point.

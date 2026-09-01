@@ -55,8 +55,15 @@ public record ExportManifestResult
 /// </summary>
 public static class ExportManifest
 {
-    /// <summary>Bump when the shape changes in a way a consumer must notice.</summary>
-    public const int SchemaVersion = 1;
+    /// <summary>
+    /// Bump when the shape changes in a way a consumer must notice.
+    /// <para>
+    /// 2 - `generator` became an object carrying the build stamp; texture entries gained
+    /// `channelSemantics`; materials gained `opacityChannel` and `distinctTextureFiles`; colour
+    /// entries gained `hexEncoding`; the root gained `schemaNotes`.
+    /// </para>
+    /// </summary>
+    public const int SchemaVersion = 2;
 
     private static readonly JsonSerializerOptions Writer = new() { WriteIndented = true };
 
@@ -324,7 +331,16 @@ public static class ExportManifest
         var manifest = new JsonObject
         {
             ["schemaVersion"] = SchemaVersion,
-            ["generator"] = $"{McpServerInfo.Name} {McpServerInfo.Version}",
+            // Which binary wrote this. A publish/mcp exe that predated the manifest feature emitted
+            // nothing at all and said nothing about it; the build stamp makes that state visible.
+            ["generator"] = new JsonObject
+            {
+                ["name"] = McpServerInfo.Name,
+                ["version"] = McpServerInfo.Version,
+                ["buildTimestampUtc"] = McpServerInfo.BuildTimestampUtc,
+                ["gitCommit"] = McpServerInfo.GitCommit,
+                ["stamp"] = McpServerInfo.BuildStamp
+            },
             ["generatedUtc"] = DateTime.UtcNow.ToString("O"),
             ["asset"] = new JsonObject
             {
@@ -370,7 +386,8 @@ public static class ExportManifest
                 ["referencedButMissing"] = ToolResults.ToJsonArray(missingTextures.Select(FileNameOf))
             },
             ["notes"] = ToolResults.ToJsonArray(assetNotes),
-            ["guidance"] = Guidance
+            ["guidance"] = Guidance,
+            ["schemaNotes"] = SchemaNotes()
         };
 
         // ---------------------------------------------------------------- write
@@ -402,10 +419,38 @@ public static class ExportManifest
         "Exported meshes carry material NAMES but no texture bindings (every glTF baseColorTexture is null), and exported "
         + "images never carry a meaningful alpha channel. Bind textures by the `parameter` name under meshes[].materials[].textures[], "
         + "not by file-name heuristics. Import the mesh named by `primaryMesh` - other entries may be shadow proxies or LODs. "
-        + "When a material is flagged opacity_in_mask_texture, its opacity lives in a channel of the listed mask texture "
-        + "(Fortnite convention for a _M / SpecularMasks map is R=specular, G=metallic, B=ambient occlusion, A/other=opacity or "
-        + "emissive - confirm against the source shader), never in the diffuse alpha. When flagged color_via_lut, the diffuse is "
+        + "When a texture entry carries `channelSemantics`, wire its channels exactly as stated: a SpecularMasks/_S map is "
+        + "R=specular, G=metallic, B=roughness (NOT R=ambient occlusion - that mis-wiring darkens base colour by 0.3-0.7x), and a "
+        + "foliage MaskTexture/_M map is R=opacity mask, G=shading detail. When a material is flagged opacity_in_mask_texture its "
+        + "opacity lives in a channel of the listed mask texture - `opacityChannel` names that channel when it is known - never in "
+        + "the diffuse alpha. Apply each texture's `sRGB` and `compressionSettings` on import: mask and specular maps are data, and "
+        + "importing them as sRGB colour gamma-decodes the data channels. Read colours from `r`/`g`/`b` (linear); `hex` is "
+        + "sRGB-encoded and is ~2.4x brighter if fed to a linear input. When flagged color_via_lut, the diffuse is "
         + "near-white luminance and the colour comes from the LUT texture and/or the vector parameters listed here.";
+
+    /// <summary>
+    /// Per-field caveats a consumer has to know but cannot infer from the field itself. Each one here
+    /// cost a round of UEFN validation to discover.
+    /// </summary>
+    private static JsonObject SchemaNotes() => new()
+    {
+        ["hex"] = "sRGB-encoded (FLinearColor.Hex). The sibling r/g/b/a fields are the true LINEAR values. "
+                  + "Feeding the parsed hex to a linear BaseColor input renders roughly 2.4x too bright - read r/g/b instead. "
+                  + "Every colour entry repeats this as hexEncoding:\"sRGB\".",
+        ["channelSemantics"] = "Per-channel meaning of a packed data texture, emitted only for parameter families whose packing "
+                               + "has been measured: SpecularMasks/_S (R=Specular, G=Metallic, B=Roughness; A is a constant 255) and "
+                               + "foliage MaskTexture/_M (R=OpacityMask, G=Shading). Absent means unknown, never \"no semantics\" - "
+                               + "inspect the channels rather than assuming a generic ORM/OSSR packing.",
+        ["opacityChannel"] = "Material-level companion to the opacity_in_mask_texture note: the channel of the mask texture named by "
+                             + "roles.mask that carries per-pixel opacity. Emitted only for the foliage MaskTexture/_M family; a "
+                             + "SpecularMasks map carries no opacity, so the field is omitted rather than guessed.",
+        ["distinctTextureFiles"] = "For a layered material: how many DISTINCT texture files its parameters name in total. Layers "
+                                   + "routinely reference one file set - a 3-layer material whose three Diffuse parameters are all the "
+                                   + "same file gains the layers_share_textures note, and building a layered master for it would only "
+                                   + "blend a texture with itself. The per-layer blend mask is not exported.",
+        ["generator"] = "Identifies the exact binary that wrote this manifest (build timestamp, git commit). get_status reports the "
+                        + "same stamp, so a published exe older than the schema a consumer expects can be detected before exporting."
+    };
 
     // ---------------------------------------------------------------- materials
 
@@ -442,6 +487,23 @@ public static class ExportManifest
         var layers = LayerCount.Match(material.Name);
         if (layers.Success) notes.Add($"layered_material_{layers.Groups[1].Value}");
 
+        // A layered material can name the SAME file in every layer: GreenhouseWall's Diffuse,
+        // Diffuse_Texture_2 and Diffuse_Texture_3 are all T_LabRat_Shell_WallPanel_A_A_D, so building a
+        // layered master for it would blend a texture with itself. Nothing in the parameter list says
+        // that; counting distinct files does. Emitted for a material the NAME calls layered, and for
+        // one whose parameters carry a numbered layer set (Diffuse_Texture_2 and friends) even when
+        // the name does not - DojoGateWall is the second case.
+        var diffuseParameters = material.Textures.Where(texture => IsDiffuseParameter(texture.Name)).ToList();
+        var numberedLayers = diffuseParameters.Any(texture => LayerSuffix.IsMatch(texture.Name));
+
+        if (layers.Success || numberedLayers)
+        {
+            json["distinctTextureFiles"] = DistinctFileCount(material.Textures);
+
+            if (diffuseParameters.Count > 1 && DistinctFileCount(diffuseParameters) == 1)
+                notes.Add("layers_share_textures");
+        }
+
         json["slot"] = material.Slot;
         json["name"] = material.Name;
         json["objectPath"] = material.Path;
@@ -475,8 +537,22 @@ public static class ExportManifest
                                            || texture.Texture.Path.Contains("LUT", StringComparison.OrdinalIgnoreCase))?.Name
         };
 
+        // opacity_in_mask_texture names the texture; this names the channel, which is the one thing a
+        // consumer previously had to guess. Only claimed for the foliage MaskTexture/_M family, whose
+        // R channel was measured as the cutout: a SpecularMasks map carries no opacity at all, so a
+        // material masked through one gets the note and no channel rather than a wrong channel.
+        if (notes.Contains("opacity_in_mask_texture") && IsFoliageMaskParameter(FirstMatching(material, IsMaskParameter)))
+            json["opacityChannel"] = "R";
+
         return json;
     }
+
+    /// <summary>Distinct texture FILES named by a set of parameters - several parameters routinely point at one file.</summary>
+    private static int DistinctFileCount(IEnumerable<TextureParameter> textures) => textures
+        .Select(texture => texture.Texture?.Path)
+        .Where(path => !string.IsNullOrEmpty(path))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Count();
 
     private static string? FirstMatching(ParameterCollection collection, Func<string, bool> predicate)
         => collection.Textures.FirstOrDefault(texture => predicate(texture.Name))?.Name;
@@ -529,7 +605,11 @@ public static class ExportManifest
                             ["g"] = pair.Value.G,
                             ["b"] = pair.Value.B,
                             ["a"] = pair.Value.A,
-                            ["hex"] = SafeHex(pair.Value)
+                            // FLinearColor.Hex is sRGB-encoded while r/g/b above are linear: 7C813A is
+                            // 0.20156/0.21953/0.04231, so a consumer that parses the hex into a linear
+                            // BaseColor input renders ~2.4x too bright. Say so on every colour.
+                            ["hex"] = SafeHex(pair.Value),
+                            ["hexEncoding"] = "sRGB"
                         }).ToArray()),
                     ["scalars"] = new JsonArray(scalars
                         .Select(pair => (JsonNode) new JsonObject
@@ -579,7 +659,9 @@ public static class ExportManifest
                     ["g"] = vector.Value.G,
                     ["b"] = vector.Value.B,
                     ["a"] = vector.Value.A,
-                    ["hex"] = SafeHex(vector.Value)
+                    // sRGB-encoded; r/g/b are the linear values. See schemaNotes.hex.
+                    ["hex"] = SafeHex(vector.Value),
+                    ["hexEncoding"] = "sRGB"
                 }).ToArray()),
             ["switches"] = new JsonArray(collection.Switches
                 .Select(item => (JsonNode) new JsonObject
@@ -610,7 +692,7 @@ public static class ExportManifest
         var bytes = onDisk.TryGetValue(path, out var known) ? known : SafeLength(path);
         var exists = bytes > 0 || File.Exists(path);
 
-        return new JsonObject
+        var json = new JsonObject
         {
             ["parameter"] = parameterName,
             ["file"] = IoPath.GetFileName(path),
@@ -623,6 +705,68 @@ public static class ExportManifest
             // 1x1 stubs (T_Fortnite_Default_S, FlatNormal, *_Swatch_*) land at ~100 bytes and are noise.
             ["placeholder"] = exists && bytes is > 0 and < 512
         };
+
+        if (ChannelSemantics(parameterName) is { } semantics) json["channelSemantics"] = semantics;
+
+        return json;
+    }
+
+    // ---------------------------------------------------------------- channel semantics
+    //
+    // Fortnite packs its data maps by convention, and the convention is not what a generic PBR importer
+    // assumes. Measured across every _S map in the UEFN validation set: G is flat zero (non-metal) and
+    // A is a constant 255 - the signature of R=specular, G=metallic, B=roughness. Wiring R to ambient
+    // occlusion instead multiplied base colour by 0.31-0.72 and rendered three assets dark and matte.
+    //
+    // The foliage mapping comes from channel dumps of both Apollo masks: R is a crisp leaf cutout on
+    // T_Apollo_Medium_Leaf_MASK and a bimodal leaf-sprite mask on T_Apollo_Hedge_M, G is a shading /
+    // detail gradient, B and A are constant. R - not the alpha, which no exported PNG carries, and not
+    // G - is the opacity channel.
+    //
+    // Matched on PARAMETER name, and only on the families that were actually measured. An unrecognised
+    // parameter gets no channelSemantics: a wrong mapping costs more than a missing one, because a
+    // consumer can still dump the channels itself but cannot know it was lied to.
+
+    /// <summary>Trailing layer index on a parameter name: SpecularMasks_2, Diffuse_Texture_3.</summary>
+    private static readonly Regex LayerSuffix = new(@"_(\d+)$", RegexOptions.Compiled);
+
+    private static string ParameterRoot(string name) => LayerSuffix.Replace(name, string.Empty);
+
+    private static readonly string[] SpecularMaskRoots = ["SpecularMasks", "SpecularMask", "Specular", "S"];
+
+    private static readonly string[] FoliageMaskRoots = ["MaskTexture", "Mask", "MASK", "M", "OpacityMask"];
+
+    /// <summary>The Fortnite _S family: R=Specular, G=Metallic, B=Roughness.</summary>
+    private static bool IsSpecularMasksParameter(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+
+        var root = ParameterRoot(name);
+        return SpecularMaskRoots.Contains(root, StringComparer.OrdinalIgnoreCase)
+               || root.EndsWith("_S", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The foliage mask family: R=OpacityMask, G=Shading.</summary>
+    private static bool IsFoliageMaskParameter(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+
+        var root = ParameterRoot(name);
+        return FoliageMaskRoots.Contains(root, StringComparer.OrdinalIgnoreCase)
+               || root.EndsWith("_MASK", StringComparison.OrdinalIgnoreCase)
+               || root.EndsWith("_M", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JsonObject? ChannelSemantics(string? parameterName)
+    {
+        // Specular first: SpecularMasks is also a "mask" by name, and its packing is the measured one.
+        if (IsSpecularMasksParameter(parameterName))
+            return new JsonObject { ["R"] = "Specular", ["G"] = "Metallic", ["B"] = "Roughness" };
+
+        if (IsFoliageMaskParameter(parameterName))
+            return new JsonObject { ["R"] = "OpacityMask", ["G"] = "Shading" };
+
+        return null;
     }
 
     // ---------------------------------------------------------------- classification

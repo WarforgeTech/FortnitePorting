@@ -32,10 +32,17 @@ public static class SystemTools
             },
             ["stage"] = LoaderGate.StageName(loader),
             ["percent"] = Math.Round(LoaderGate.Percent(loader), 1),
+            // Build stamp and schema version are echoed so a client can tell that the exe it is
+            // talking to is older than the source tree it expects - a stale publish/mcp otherwise
+            // just quietly omits whatever feature was added since.
             ["server"] = new JsonObject
             {
                 ["name"] = McpServerInfo.Name,
-                ["version"] = McpServerInfo.Version
+                ["version"] = McpServerInfo.Version,
+                ["buildTimestampUtc"] = McpServerInfo.BuildTimestampUtc,
+                ["gitCommit"] = McpServerInfo.GitCommit,
+                ["buildStamp"] = McpServerInfo.BuildStamp,
+                ["manifestSchemaVersion"] = ExportManifest.SchemaVersion
             },
             ["archive"] = new JsonObject
             {
@@ -141,6 +148,35 @@ public static class McpServerInfo
     public const string Name = "fortnite-porting";
     public const string Title = "FortnitePorting Asset Server";
 
-    public static string Version { get; } =
-        Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.1.0";
+    private static readonly Assembly Self = Assembly.GetExecutingAssembly();
+
+    public static string Version { get; } = Self.GetName().Version?.ToString(3) ?? "0.1.0";
+
+    /// <summary>UTC time this assembly was compiled, stamped by the StampBuild target in the csproj.</summary>
+    public static string? BuildTimestampUtc { get; } = Metadata("BuildTimestampUtc");
+
+    /// <summary>Short git commit the assembly was built from. Null when git was unavailable at build time.</summary>
+    public static string? GitCommit { get; } = Metadata("GitCommit");
+
+    /// <summary>
+    /// One line saying exactly which binary is answering. A published exe that predated the manifest
+    /// feature silently produced no manifests during UEFN round-2 validation and nothing in its output
+    /// revealed that, so this is echoed by get_status and written into every export manifest.
+    /// </summary>
+    public static string BuildStamp { get; } = Compose();
+
+    private static string Compose()
+    {
+        var parts = new List<string> { $"{Name} {Version}" };
+        if (GitCommit is not null) parts.Add($"commit {GitCommit}");
+        parts.Add(BuildTimestampUtc is null ? "built unknown" : $"built {BuildTimestampUtc}");
+        return string.Join(", ", parts);
+    }
+
+    private static string? Metadata(string key)
+        => Self.GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(attribute => string.Equals(attribute.Key, key, StringComparison.Ordinal))
+            ?.Value is { Length: > 0 } value
+            ? value
+            : null;
 }

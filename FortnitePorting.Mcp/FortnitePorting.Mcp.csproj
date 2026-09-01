@@ -27,6 +27,40 @@
     </ItemGroup>
 
     <!--
+      Build stamp. UEFN round-2 validation lost an hour to a published exe that predated the manifest
+      feature: it emitted no manifests, reported no error, and nothing in its output said which build
+      was answering. These two assembly metadata values give every manifest and every get_status call
+      a "which binary is this?" line, so a stale publish/mcp is visible from the client side.
+      The git call is best-effort - a source drop without git still builds, just without the commit.
+    -->
+    <Target Name="StampBuild" BeforeTargets="GetAssemblyAttributes">
+        <PropertyGroup>
+            <BuildTimestampUtc>$([System.DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))</BuildTimestampUtc>
+        </PropertyGroup>
+
+        <Exec Command="git rev-parse --short=10 HEAD"
+              WorkingDirectory="$(MSBuildProjectDirectory)"
+              ConsoleToMSBuild="true"
+              StandardOutputImportance="low"
+              StandardErrorImportance="low"
+              IgnoreExitCode="true"
+              ContinueOnError="true">
+            <Output TaskParameter="ConsoleOutput" PropertyName="BuildGitCommit" />
+        </Exec>
+
+        <ItemGroup>
+            <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+                <_Parameter1>BuildTimestampUtc</_Parameter1>
+                <_Parameter2>$(BuildTimestampUtc)</_Parameter2>
+            </AssemblyAttribute>
+            <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute" Condition="'$(BuildGitCommit)' != ''">
+                <_Parameter1>GitCommit</_Parameter1>
+                <_Parameter2>$(BuildGitCommit.Trim())</_Parameter2>
+            </AssemblyAttribute>
+        </ItemGroup>
+    </Target>
+
+    <!--
       The unmanaged ACL decoder. Without it every ACL-compressed UAnimSequence - i.e. every
       Fortnite emote - fails to convert and the export silently comes out with no .ueanim.
       CUE4Parse's own Build-Natives target is a no-op without CMake + MSVC, so a known-good
