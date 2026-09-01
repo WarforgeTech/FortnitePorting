@@ -389,6 +389,10 @@ round-1 packing (`B=ambient occlusion`), which is exactly the error round 2 disp
 * `get_status` → `server: { version 1.0.0, buildTimestampUtc "2026-09-01T03:44:02Z", gitCommit
   "ffe69f1843", buildStamp "fortnite-porting 1.0.0, commit ffe69f1843, built 2026-09-01T03:44:02Z",
   manifestSchemaVersion 2 }`. A stale publish now shows itself before an export, not after.
+  `publish/mcp` was then re-published from the commit itself and re-checked (`--selftest` PASSED,
+  stamp `commit f19fcfeec2, built 2026-09-01T03:47:11Z`), so the shipped exe reports the commit it
+  was actually built from rather than that commit's parent. The manifests below were written by the
+  pre-commit build of identical source and still read `ffe69f1843` — which is the feature working.
 * Re-exported ApolloBigBush, ApolloHedgeCube, DojoGateWall, GreenhouseWall — all four manifests
   `schemaVersion: 2` with the same generator stamp.
 * **channelSemantics**: `SpecularMasks`, `_2`, `_3`, `_4` on DojoGateWall and `_1`–`_3` on
