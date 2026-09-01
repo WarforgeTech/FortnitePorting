@@ -47,6 +47,9 @@ try
     if (args.Contains("--iconcoverage", StringComparer.OrdinalIgnoreCase))
         return await CliModes.IconCoverageAsync(config, args);
 
+    if (args.Contains("--nameindex", StringComparer.OrdinalIgnoreCase))
+        return await CliModes.BuildNameIndexAsync(config, args);
+
     return await McpServerMode.RunAsync(config, args);
 }
 catch (Exception e)
@@ -98,6 +101,7 @@ internal static class McpServices
         services.AddSingleton<HeadlessLoader>();
         services.AddSingleton<DependencyManager>();
         services.AddSingleton<AssetQuery>();
+        services.AddSingleton<DisplayNameIndex>();
         services.AddSingleton<IconResolver>();
         services.AddSingleton<FileIndex>();
         services.AddSingleton<HeadlessExportAssetProvider>();
@@ -201,6 +205,10 @@ internal static class CliModes
         await loader.WaitReadyAsync();
         Log.Information("Archive ready in {Seconds:N1}s", (DateTime.Now - started).TotalSeconds);
 
+        // Parity with the stdio server (ArchiveHostedService): the display-name index builds in the
+        // background once the archive is up, so --call exercises the exact same readiness behaviour.
+        provider.GetRequiredService<DisplayNameIndex>().StartBackgroundBuild();
+
         CallToolResult result;
         var invokedAt = DateTime.Now;
         try
@@ -246,6 +254,49 @@ internal static class CliModes
         }
 
         return result.IsError == true ? 1 : 0;
+    }
+
+    /// <summary>
+    /// Builds the display-name index in the foreground with per-category timings and memory, which
+    /// is what the background build does on a cold server run - just observable. Optional
+    /// <c>--category &lt;Name&gt;</c> restricts it to one category.
+    /// </summary>
+    public static async Task<int> BuildNameIndexAsync(McpConfig config, string[] args)
+    {
+        var only = McpConfig.GetArgumentValue(args, "--category");
+
+        var services = new ServiceCollection();
+        McpServices.Register(services, config);
+        await using var provider = services.BuildServiceProvider();
+
+        var loader = provider.GetRequiredService<HeadlessLoader>();
+        var started = DateTime.Now;
+        await loader.WaitReadyAsync();
+        Log.Information("Archive ready in {Seconds:N1}s", (DateTime.Now - started).TotalSeconds);
+
+        var names = provider.GetRequiredService<DisplayNameIndex>();
+        var indexStarted = DateTime.Now;
+
+        if (string.IsNullOrWhiteSpace(only))
+        {
+            await names.BuildAllAsync(CancellationToken.None);
+        }
+        else
+        {
+            var entry = AssetQuery.ResolveCategory(only);
+            await names.WhenCategoryReadyAsync(entry.Type, Timeout.InfiniteTimeSpan);
+        }
+
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        Log.Information("Name index finished in {Seconds:N1}s - {Names:N0} display names, {Ready}/{Total} categories ready",
+            (DateTime.Now - indexStarted).TotalSeconds, names.TotalNames, names.ReadyCategoryCount, names.TotalCategoryCount);
+        Log.Information("Memory: {Managed:N0} MB managed heap, {WorkingSet:N0} MB working set, {Peak:N0} MB peak working set",
+            GC.GetTotalMemory(false) / (1024 * 1024), process.WorkingSet64 / (1024 * 1024), process.PeakWorkingSet64 / (1024 * 1024));
+
+        foreach (var snapshot in names.Snapshot().OrderByDescending(x => x.Rows))
+            Log.Information("  {Category,-18} {Status,-9} {Names,7:N0} names / {Rows,7:N0} rows", snapshot.Category, snapshot.State.Name, snapshot.Count, snapshot.Rows);
+
+        return names.ReadyCategoryCount > 0 ? 0 : 1;
     }
 
     /// <summary>

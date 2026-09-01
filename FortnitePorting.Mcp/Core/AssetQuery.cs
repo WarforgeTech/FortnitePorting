@@ -96,6 +96,16 @@ public sealed class AssetQuery(HeadlessLoader loader)
 
     public static Func<FPartialAssetData, bool> BuildMatcher(string query, string match)
     {
+        var predicate = BuildStringMatcher(query, match);
+        return data => predicate(data.AssetName.Text) || predicate(data.PackageName.Text);
+    }
+
+    /// <summary>
+    /// The same contains/regex semantics as <see cref="BuildMatcher"/> but over a bare string, so
+    /// display names out of <see cref="DisplayNameIndex"/> are matched exactly like asset names.
+    /// </summary>
+    public static Func<string, bool> BuildStringMatcher(string query, string match)
+    {
         if (string.IsNullOrWhiteSpace(query)) return _ => true;
 
         if (match.Equals("regex", StringComparison.OrdinalIgnoreCase))
@@ -110,9 +120,9 @@ public sealed class AssetQuery(HeadlessLoader loader)
                 throw new McpException($"Invalid regular expression \"{query}\": {e.Message}");
             }
 
-            return data =>
+            return value =>
             {
-                try { return regex.IsMatch(data.AssetName.Text) || regex.IsMatch(data.PackageName.Text); }
+                try { return regex.IsMatch(value); }
                 catch (RegexMatchTimeoutException) { return false; }
             };
         }
@@ -120,7 +130,6 @@ public sealed class AssetQuery(HeadlessLoader loader)
         if (!match.Equals("contains", StringComparison.OrdinalIgnoreCase))
             throw new McpException($"Unknown match mode \"{match}\". Use \"contains\" or \"regex\".");
 
-        return data => data.AssetName.Text.Contains(query, StringComparison.OrdinalIgnoreCase)
-                       || data.PackageName.Text.Contains(query, StringComparison.OrdinalIgnoreCase);
+        return value => value.Contains(query, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -81,14 +81,19 @@ public static class DiscoveryTools
 
     [McpServerTool(Name = "search_assets", ReadOnly = true, Title = "Search assets")]
     [Description("""
-                 Fast asset-registry search over asset and package names. Never opens a .uasset, so it
-                 stays responsive across hundreds of thousands of rows. Use it to find candidates, then
-                 make_contact_sheet to actually SEE them.
+                 Fast asset-registry search over asset names, package paths AND in-game display names.
+                 Never opens a .uasset, so it stays responsive across hundreds of thousands of rows -
+                 display names come from a background-built, disk-cached index (see get_status ->
+                 nameIndex; while a category is still building, matching for it falls back to asset and
+                 package names only and the reply says so). Every item reports matchedOn:
+                 name | displayName | both. Use it to find candidates, then make_contact_sheet to
+                 actually SEE them.
                  """)]
     public static async Task<CallToolResult> SearchAssetsAsync(
         HeadlessLoader loader,
         AssetQuery assets,
-        [Description("Text to look for in the asset name or package path, e.g. \"hedge\".")] string query,
+        DisplayNameIndex names,
+        [Description("Text to look for in the asset name, package path or in-game display name, e.g. \"hedge\" or \"Peely\".")] string query,
         [Description("Optional category filter, e.g. \"Prop\" or \"Outfit\". See list_categories.")] string? category = null,
         [Description("\"contains\" (default) or \"regex\".")] string match = "contains",
         [Description("Maximum rows to return. Capped at 100.")] int limit = 25,
@@ -100,42 +105,77 @@ public static class DiscoveryTools
         limit = Math.Clamp(limit, 1, SearchLimitCap);
         offset = Math.Max(0, offset);
 
-        var matcher = AssetQuery.BuildMatcher(query, match);
+        var predicate = AssetQuery.BuildStringMatcher(query, match);
 
         IEnumerable<FPartialAssetData> source;
         string? resolvedCategory = null;
+        EExportType? scopedType = null;
+
         if (!string.IsNullOrWhiteSpace(category))
         {
             var entry = AssetQuery.ResolveCategory(category);
             resolvedCategory = entry.Type.ToString();
+            scopedType = entry.Type;
             source = assets.Filtered(entry);
+
+            // Cheap when the category is cached on disk; otherwise this returns false quickly and
+            // the search degrades to name-only matching with a note.
+            await names.WhenCategoryReadyAsync(entry.Type, cancellationToken: cancellationToken);
         }
         else
         {
             source = assets.AllCategorised();
+
+            // No single category to wait on: give the whole index a short grace (a warm run loads
+            // every category off disk well inside it) and otherwise report partial coverage.
+            await names.WhenAllReadyAsync(cancellationToken: cancellationToken);
         }
 
-        var matched = new List<FPartialAssetData>();
+        // Single in-memory pass: registry substring/regex plus a dictionary hit for the display name.
+        var scopedMap = scopedType is { } type ? names.MapFor(type) : null;
+        var matched = new List<(FPartialAssetData Data, string? DisplayName, string MatchedOn)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var data in source)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (matcher(data)) matched.Add(data);
+
+            var nameHit = predicate(data.AssetName.Text) || predicate(data.PackageName.Text);
+
+            var displayName = scopedMap is not null
+                ? scopedMap.GetValueOrDefault(data.ObjectPath)
+                : names.DisplayNameForClass(data.AssetClass.Text, data.ObjectPath);
+
+            var displayHit = displayName is not null && predicate(displayName);
+            if (!nameHit && !displayHit) continue;
+
+            // The registry is concatenated from several .bin files, so the same row can appear twice.
+            if (!seen.Add(data.ObjectPath)) continue;
+
+            matched.Add((data, displayName, (nameHit, displayHit) switch
+            {
+                (true, true) => "both",
+                (false, true) => "displayName",
+                _ => "name"
+            }));
         }
 
         var items = new JsonArray();
-        foreach (var data in matched.Skip(offset).Take(limit))
+        foreach (var (data, displayName, matchedOn) in matched.Skip(offset).Take(limit))
         {
             items.Add(new JsonObject
             {
                 ["name"] = data.AssetName.Text,
+                ["displayName"] = displayName,
                 ["objectPath"] = data.ObjectPath,
                 ["packagePath"] = data.PackageName.Text,
                 ["assetClass"] = data.AssetClass.Text,
-                ["category"] = assets.CategoryForClass(data.AssetClass.Text)
+                ["category"] = assets.CategoryForClass(data.AssetClass.Text),
+                ["matchedOn"] = matchedOn
             });
         }
 
-        return ToolResults.Structured(new JsonObject
+        var payload = new JsonObject
         {
             ["status"] = "ok",
             ["query"] = query,
@@ -145,8 +185,59 @@ public static class DiscoveryTools
             ["offset"] = offset,
             ["limit"] = limit,
             ["returned"] = items.Count,
+            ["nameIndex"] = NameIndexSummary(names, scopedType),
             ["items"] = items
-        });
+        };
+
+        var notes = new List<string>();
+
+        if (scopedType is { } scoped)
+        {
+            if (!names.IsReady(scoped))
+                notes.Add($"Display-name coverage for {scoped} is {names.StateFor(scoped).Name} ({names.StateFor(scoped).Percent:N0}%), " +
+                          "so these results matched asset/package names only. Retry in a minute for display-name matches.");
+        }
+        else if (names.Coverage is not "complete")
+        {
+            notes.Add($"Display-name coverage is {names.Coverage}: {names.ReadyCategoryCount}/{names.TotalCategoryCount} categories indexed. " +
+                      "Categories still building matched asset/package names only; pass `category` to wait for one specific category.");
+        }
+
+        if (matched.Count == 0)
+        {
+            notes.Add($"No asset matched \"{query}\". Try a shorter or more generic term (\"hedge\" rather than \"hedge wall large\"), " +
+                      "a synonym (\"foliage\", \"bush\", \"plant\"), check the spelling, drop the `category` filter, " +
+                      "or use match:\"regex\" for alternatives like \"hedge|bush|shrub\". " +
+                      "browse_category plus make_contact_sheet is the reliable way to browse a category visually when you do not know the vocabulary.");
+        }
+
+        if (notes.Count > 0) payload["note"] = string.Join(" ", notes);
+
+        return ToolResults.Structured(payload);
+    }
+
+    /// <summary>Compact per-request view of the display-name index, for the search reply.</summary>
+    private static JsonObject NameIndexSummary(DisplayNameIndex names, EExportType? scoped)
+    {
+        if (scoped is { } type)
+        {
+            var state = names.StateFor(type);
+            return new JsonObject
+            {
+                ["category"] = type.ToString(),
+                ["status"] = state.Name,
+                ["percent"] = Math.Round(state.Percent, 1),
+                ["displayNames"] = names.CountFor(type)
+            };
+        }
+
+        return new JsonObject
+        {
+            ["coverage"] = names.Coverage,
+            ["readyCategories"] = names.ReadyCategoryCount,
+            ["totalCategories"] = names.TotalCategoryCount,
+            ["displayNames"] = names.TotalNames
+        };
     }
 
     // ------------------------------------------------------------------ browse_category

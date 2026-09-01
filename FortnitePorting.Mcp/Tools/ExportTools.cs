@@ -427,7 +427,7 @@ public static class ExportTools
             var provider = services.GetService<HeadlessExportAssetProvider>() ?? new HeadlessExportAssetProvider(loader, dependencies);
 
             Log.Warning("ExportRunner was not registered in DI; using a process-wide fallback instance.");
-            _fallbackRunner = new ExportRunner(loader, provider, config);
+            _fallbackRunner = new ExportRunner(loader, provider, config, services.GetService<DisplayNameIndex>());
             return _fallbackRunner;
         }
     }

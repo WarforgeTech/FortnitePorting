@@ -17,7 +17,7 @@ public static class SystemTools
                  instant the server starts. The archive takes roughly 7 seconds to mount; every other
                  tool waits briefly and then returns status:"loading" instead of failing.
                  """)]
-    public static CallToolResult GetStatus(HeadlessLoader loader, McpConfig config)
+    public static CallToolResult GetStatus(HeadlessLoader loader, McpConfig config, DisplayNameIndex names)
     {
         var state = loader.State;
 
@@ -49,6 +49,8 @@ public static class SystemTools
         if (state is LoadState.Failed failed)
             payload["error"] = failed.Message;
 
+        payload["nameIndex"] = NameIndexPayload(names);
+
         if (state is LoadState.Ready)
         {
             payload["counts"] = new JsonObject
@@ -75,6 +77,45 @@ public static class SystemTools
         }
 
         return ToolResults.Structured(payload);
+    }
+
+    /// <summary>
+    /// Per-category state of the display-name index that search_assets matches against. It builds in
+    /// the background after the archive mounts and is cached on disk, so this is "ready" within
+    /// seconds on a warm run and climbs through the categories on a cold one.
+    /// </summary>
+    private static JsonObject NameIndexPayload(DisplayNameIndex names)
+    {
+        var categories = new JsonObject();
+        foreach (var snapshot in names.Snapshot())
+        {
+            var entry = new JsonObject
+            {
+                ["status"] = snapshot.State.Name,
+                ["displayNames"] = snapshot.Count
+            };
+
+            if (snapshot.State is NameIndexState.Building)
+            {
+                entry["percent"] = Math.Round(snapshot.State.Percent, 1);
+                entry["rows"] = snapshot.Rows;
+            }
+
+            if (snapshot.State is NameIndexState.Failed failure)
+                entry["error"] = failure.Message;
+
+            categories[snapshot.Category] = entry;
+        }
+
+        return new JsonObject
+        {
+            ["coverage"] = names.Coverage,
+            ["readyCategories"] = names.ReadyCategoryCount,
+            ["totalCategories"] = names.TotalCategoryCount,
+            ["displayNames"] = names.TotalNames,
+            ["categories"] = categories,
+            ["note"] = "search_assets matches display names for every category listed as \"ready\"; the rest match asset/package names only until their build finishes."
+        };
     }
 
     private static int SafeFileCount(HeadlessLoader loader)

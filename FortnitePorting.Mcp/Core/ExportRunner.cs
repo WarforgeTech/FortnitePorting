@@ -82,7 +82,7 @@ public record GalleryExportResult
 /// Exports are deliberately serialized: the CUE4Parse conversion path keeps static
 /// caches that are not safe to drive from several threads at once.
 /// </summary>
-public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exportProvider, McpConfig config)
+public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exportProvider, McpConfig config, DisplayNameIndex? names = null)
 {
     public McpConfig Config { get; } = config;
 
@@ -257,13 +257,46 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             : (members, "none");
     }
 
-    /// <summary>Registry search over FortPlaysetItemDefinition rows by asset name or display name.</summary>
+    /// <summary>
+    /// Registry search over FortPlaysetItemDefinition rows by asset name or display name.
+    /// <para>
+    /// When the Prefab display-name index is available this is a pure in-memory scan. Only when it
+    /// is not (first cold run, before the background build reaches Prefab) does this fall back to
+    /// the original behaviour of opening every playset package, which costs several seconds.
+    /// </para>
+    /// </summary>
     public async Task<List<(string ObjectPath, string AssetName, string DisplayName)>> FindGalleries(string query, int limit = 25)
     {
         var matches = new List<(string, string, string)>();
         var rows = loader.AssetRegistry
             .Where(data => data.AssetClass.Text.Equals("FortPlaysetItemDefinition", StringComparison.Ordinal))
             .ToList();
+
+        // Fast path: the display-name index answers without touching a single .uasset.
+        if (names is not null && await names.WhenCategoryReadyAsync(EExportType.Prefab))
+        {
+            var map = names.MapFor(EExportType.Prefab);
+            if (map is not null)
+            {
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var data in rows)
+                {
+                    if (matches.Count >= limit) break;
+
+                    var assetName = data.AssetName.Text;
+                    var indexed = map.GetValueOrDefault(data.ObjectPath);
+
+                    var nameMatches = assetName.Contains(query, StringComparison.OrdinalIgnoreCase);
+                    var displayMatches = indexed?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false;
+                    if (!nameMatches && !displayMatches) continue;
+                    if (!seen.Add(data.ObjectPath)) continue;
+
+                    matches.Add((data.ObjectPath, assetName, indexed ?? assetName));
+                }
+
+                return matches;
+            }
+        }
 
         // Cheap pass first: asset-name substring, no package loads at all.
         var nameHits = rows

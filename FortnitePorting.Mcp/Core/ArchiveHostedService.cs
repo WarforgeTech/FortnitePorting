@@ -10,7 +10,7 @@ namespace FortnitePorting.Mcp.Core;
 /// the MCP stdio session is itself a hosted service. Awaiting the ~7 s archive load here would
 /// stall the transport and the `initialize` handshake would never be answered.
 /// </summary>
-public sealed class ArchiveHostedService(HeadlessLoader loader) : IHostedService
+public sealed class ArchiveHostedService(HeadlessLoader loader, DisplayNameIndex names) : IHostedService
 {
     private Task? _run;
 
@@ -23,6 +23,10 @@ public sealed class ArchiveHostedService(HeadlessLoader loader) : IHostedService
             {
                 await loader.WhenReady();
                 Log.Information("Archive ready; {Count:N0} asset registry entries", loader.AssetRegistry.Count);
+
+                // Fire-and-forget: search works name-only until each category lands, and this
+                // must never be able to take the server down.
+                names.StartBackgroundBuild();
             }
             catch (Exception e)
             {
