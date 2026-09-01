@@ -359,8 +359,8 @@ internal static class CliModes
         foreach (var (name, elapsed) in result.PhaseTimings)
             Log.Information("  {Phase,-14} {Seconds,7:N1}s", name, elapsed.TotalSeconds);
 
-        Log.Information("Rows: {Full:N0} full / {Core:N0} core props, {Galleries:N0} galleries, {Scopes:N0} scopes, {Failures:N0} failure lines",
-            result.Counts.FullRows, result.Counts.CoreRows, result.Counts.Galleries, result.Counts.Scopes, result.Counts.Failures);
+        Log.Information("Rows: {Full:N0} props, {Galleries:N0} galleries, {Scopes:N0} scopes, {Failures:N0} failure lines",
+            result.Counts.FullRows, result.Counts.Galleries, result.Counts.Scopes, result.Counts.Failures);
 
         foreach (var file in new DirectoryInfo(result.IndexDirectory).EnumerateFiles().OrderBy(file => file.Name, StringComparer.Ordinal))
             Log.Information("  {Name,-20} {Bytes,12:N0} bytes", file.Name, file.Length);

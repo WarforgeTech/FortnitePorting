@@ -46,7 +46,7 @@ public sealed record PropRow
     [JsonPropertyName("kw")] public List<string> Kw { get; init; } = [];
 }
 
-/// <summary>One creative gallery. Members are found by grepping props-*.jsonl for the gallery id.</summary>
+/// <summary>One creative gallery. Members are found by grepping props-full.jsonl for the gallery id.</summary>
 public sealed record GalleryRow
 {
     [JsonPropertyName("id")] public required string Id { get; init; }
@@ -198,6 +198,12 @@ public static class IndexWriters
             blueprint exposed no static mesh (particle-only props, splines, volumes); it is still
             placeable, its size is just not knowable from the archive.
 
+            **A row can have `sz` but no `sm`.** When every mesh a blueprint exposes is a shadow
+            proxy, `sm` is deliberately null: a proxy measures correctly but `CaptureAssetImage`
+            renders it as a featureless blob, which is worse than showing nothing. The size is still
+            reported from the proxy, and `dump-report.log` names the mesh that was suppressed. Place
+            these by `ppid` and skip the preview.
+
             ## Scopes
 
             `verified` says whether somebody actually drove the editor against that mount, and with
@@ -217,20 +223,14 @@ public static class IndexWriters
             builder.AppendLine($"| `{scope.ScopeId}` | `{scope.UefnPath}` | {Dash(scope.Theme)} | {scope.RowCount:N0} | {verified} | {vocabulary} |");
         }
 
-        var corePercent = counts.FullRows == 0 ? 0 : counts.CoreRows * 100.0 / counts.FullRows;
-        var coreNote = corePercent >= 90
-            ? $"Gallery members plus curated families - which on this archive is **{corePercent:N0}% of `props-full.jsonl`**, because nearly every prop belongs to some gallery. The split earns you nothing here: grep `props-full.jsonl` and ignore this file."
-            : "Gallery members plus curated families. Grep this first - smaller, denser, and every row is something a builder actually reaches for.";
-
         builder.Append($"""
 
             ## Files
 
             | file | rows | what it is |
             | --- | ---: | --- |
-            | `props-full.jsonl` | {counts.FullRows:N0} | Every canonical display-named prop. Grep this for coverage. |
-            | `props-core.jsonl` | {counts.CoreRows:N0} | {coreNote} |
-            | `galleries.jsonl` | {counts.Galleries:N0} | Creative galleries. To list a gallery's contents, grep its `id` in `props-*.jsonl`. |
+            | `props-full.jsonl` | {counts.FullRows:N0} | Every canonical display-named prop. This is the one you grep. |
+            | `galleries.jsonl` | {counts.Galleries:N0} | Creative galleries. To list a gallery's contents, grep its `id` in `props-full.jsonl`. |
             | `scopes.tsv` | {counts.Scopes:N0} | Mount table. A row is counted against every mount it reaches (PPID, blueprint and mesh), so the totals exceed {counts.FullRows:N0}. |
             | `dump-report.log` | {counts.Failures:N0} | Per-row failures from this dump. A row with a null `bp` or `sm` has a line here saying why. |
 
@@ -250,7 +250,6 @@ public static class IndexWriters
 public sealed record IndexCounts
 {
     public required int FullRows { get; init; }
-    public required int CoreRows { get; init; }
     public required int Galleries { get; init; }
     public required int Scopes { get; init; }
     public required int Failures { get; init; }

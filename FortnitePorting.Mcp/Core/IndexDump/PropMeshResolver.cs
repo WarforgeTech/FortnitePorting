@@ -93,23 +93,74 @@ public sealed class PropMeshResolver(HeadlessLoader loader)
         if (blueprint is null)
             return placement with { Failure = "blueprint class did not load" };
 
-        var meshPath = FirstStaticMeshPath(blueprint);
-        if (meshPath is null)
+        var candidates = CollectStaticMeshPaths(blueprint);
+        if (candidates.Count == 0)
             return placement with { Failure = "blueprint exposes no StaticMesh (SCS/ICH/CDO all empty)" };
 
-        var uefnMeshPath = ToUefnObjectPath(meshPath);
-        if (uefnMeshPath is null)
-            return placement with { Failure = $"StaticMesh \"{meshPath}\" maps to no known mount" };
+        var mapped = candidates
+            .Select(ToUefnObjectPath)
+            .Where(path => path is not null)
+            .Select(path => path!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-        var result = placement with { StaticMeshPath = PackageHalf(uefnMeshPath) };
+        if (mapped.Count == 0)
+            return placement with { Failure = $"StaticMesh \"{candidates[0]}\" maps to no known mount" };
+
+        // A shadow proxy or collision hull is a real mesh with roughly the right bounds and no
+        // visual worth looking at - CaptureAssetImage renders it as a grey blob, which is worse
+        // than showing the agent nothing. Prefer anything else; measure the proxy either way.
+        var visual = mapped.FirstOrDefault(path => !IsNonVisualMesh(path));
+        var forBounds = visual ?? mapped[0];
+
+        var result = placement with { StaticMeshPath = visual is null ? null : PackageHalf(visual) };
+        if (visual is null)
+            result = result with
+            {
+                Failure = $"only non-visual meshes found ({LeafOf(mapped[0])}); sm suppressed, sz still measured from it"
+            };
+
         if (!wantBounds) return result;
 
-        var bounds = await MeshBounds.ReadAsync(uefnMeshPath,
+        var bounds = await MeshBounds.ReadAsync(forBounds,
             path => loader.Provider.SafeLoadPackageObjectAsync(path));
 
         if (bounds is not { } value) return result;
 
         return result with { Size = [Round(value.SizeX), Round(value.SizeY), Round(value.SizeZ)] };
+    }
+
+    /// <summary>
+    /// Names that mark a mesh as a stand-in with no visual worth rendering.
+    /// <para>
+    /// Deliberately narrow, and narrowed twice by measurement rather than taste. "blockout" and
+    /// "_lod" came out first: they accounted for 348 of 351 suppressions on 42.00 and both are real
+    /// geometry a builder places on purpose - Blockout is an intentional grey-box prop family, and
+    /// an LOD mesh renders the same silhouette at lower detail. "collision" came out next: its only
+    /// two hits on the whole archive were <c>Creative_Helipad_NoCollision</c> and
+    /// <c>PlayGround_MerryGoRound_01_collisionFix</c>, both real visual meshes whose names merely
+    /// contain the word. A substring rule cannot tell a collision hull from a mesh named after not
+    /// having one, so it does not try.
+    /// </para>
+    /// <para>
+    /// What is left is unambiguous: a shadow proxy renders as a featureless dark blob and is never
+    /// the thing the player sees.
+    /// </para>
+    /// </summary>
+    private static readonly string[] NonVisualMeshHints = ["proxy", "shadowcaster"];
+
+    private static bool IsNonVisualMesh(string path)
+    {
+        var leaf = LeafOf(path);
+        return NonVisualMeshHints.Any(hint => leaf.Contains(hint, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string LeafOf(string path)
+    {
+        var slash = path.LastIndexOf('/');
+        var leaf = slash >= 0 ? path[(slash + 1)..] : path;
+        var dot = leaf.LastIndexOf('.');
+        return dot > 0 ? leaf[..dot] : leaf;
     }
 
     // ---------------------------------------------------------------- internals
@@ -138,96 +189,104 @@ public sealed class PropMeshResolver(HeadlessLoader loader)
     }
 
     /// <summary>
-    /// Walks a blueprint generated class the same three ways the exporter does, in the same order:
-    /// the simple construction script, then inherited component records, then the class default
-    /// object. Most creative props answer on the first; parented ones need the second; a handful
-    /// only ever set their mesh on the CDO.
+    /// Every static mesh a blueprint generated class exposes, in the order the exporter looks: the
+    /// simple construction script, then inherited component records, then the class default object.
+    /// Most creative props answer on the first; parented ones need the second; a handful only ever
+    /// set their mesh on the CDO.
+    /// <para>
+    /// This collects rather than short-circuits because the FIRST mesh a blueprint names is often a
+    /// shadow proxy or collision hull, and the caller needs to see the alternatives before it picks.
+    /// The parent class is walked only when the child produced nothing usable, so a normal prop
+    /// still costs no extra loads.
+    /// </para>
     /// </summary>
-    private static string? FirstStaticMeshPath(UObject blueprint)
+    private static List<string> CollectStaticMeshPaths(UObject blueprint)
     {
-        if (FromConstructionScript(blueprint) is { } fromScs) return fromScs;
-        if (FromInheritableComponents(blueprint) is { } fromIch) return fromIch;
-        if (FromClassDefaultObject(blueprint) is { } fromCdo) return fromCdo;
+        var found = new List<string>();
+        CollectFrom(blueprint, found);
 
-        // A blueprint can inherit its whole visual from its parent class.
-        try
+        // A blueprint can inherit its whole visual from its parent class - and a child that only
+        // declares a proxy may inherit the real mesh, so climb on all-proxy too, not just on empty.
+        if (found.Count == 0 || found.TrueForAll(IsNonVisualMesh))
         {
-            if (blueprint is UStruct { SuperStruct: { } super } && super.TryLoad(out var parent) && parent is UObject parentObject)
-                return FromConstructionScript(parentObject)
-                       ?? FromInheritableComponents(parentObject)
-                       ?? FromClassDefaultObject(parentObject);
-        }
-        catch (Exception e)
-        {
-            Log.Debug("Parent-class walk failed for {Name}: {Message}", blueprint.Name, e.Message);
+            try
+            {
+                if (blueprint is UStruct { SuperStruct: { } super } && super.TryLoad(out var parent) && parent is { } parentObject)
+                    CollectFrom(parentObject, found);
+            }
+            catch (Exception e)
+            {
+                Log.Debug("Parent-class walk failed for {Name}: {Message}", blueprint.Name, e.Message);
+            }
         }
 
-        return null;
+        return found;
     }
 
-    private static string? FromConstructionScript(UObject blueprint)
+    private static void CollectFrom(UObject blueprint, List<string> found)
+    {
+        FromConstructionScript(blueprint, found);
+        FromInheritableComponents(blueprint, found);
+        FromClassDefaultObject(blueprint, found);
+    }
+
+    private static void FromConstructionScript(UObject blueprint, List<string> found)
     {
         try
         {
-            if (!blueprint.TryGetValue(out UObject constructionScript, "SimpleConstructionScript")) return null;
+            if (!blueprint.TryGetValue(out UObject constructionScript, "SimpleConstructionScript")) return;
 
             foreach (var node in constructionScript.GetOrDefault("AllNodes", Array.Empty<UObject>()))
             {
                 if (node is null) continue;
-                if (MeshOf(node.GetOrDefault<UObject?>("ComponentTemplate")) is { } path) return path;
+                if (MeshOf(node.GetOrDefault<UObject?>("ComponentTemplate")) is { } path) found.Add(path);
             }
         }
         catch (Exception e)
         {
             Log.Debug("SCS walk failed for {Name}: {Message}", blueprint.Name, e.Message);
         }
-
-        return null;
     }
 
-    private static string? FromInheritableComponents(UObject blueprint)
+    private static void FromInheritableComponents(UObject blueprint, List<string> found)
     {
         try
         {
-            if (!blueprint.TryGetValue(out UObject handler, "InheritableComponentHandler")) return null;
+            if (!blueprint.TryGetValue(out UObject handler, "InheritableComponentHandler")) return;
 
             foreach (var record in handler.GetOrDefault("Records", Array.Empty<FStructFallback>()))
             {
                 if (record is null) continue;
-                if (MeshOf(record.GetOrDefault<UObject?>("ComponentTemplate")) is { } path) return path;
+                if (MeshOf(record.GetOrDefault<UObject?>("ComponentTemplate")) is { } path) found.Add(path);
             }
         }
         catch (Exception e)
         {
             Log.Debug("InheritableComponentHandler walk failed for {Name}: {Message}", blueprint.Name, e.Message);
         }
-
-        return null;
     }
 
-    private static string? FromClassDefaultObject(UObject blueprint)
+    private static void FromClassDefaultObject(UObject blueprint, List<string> found)
     {
         try
         {
-            if (blueprint is not UBlueprintGeneratedClass generated) return null;
-            if (generated.ClassDefaultObject is not { } lazy || !lazy.TryLoad(out var cdo) || cdo is not UObject defaults) return null;
+            if (blueprint is not UBlueprintGeneratedClass generated) return;
+            if (generated.ClassDefaultObject is not { } lazy || !lazy.TryLoad(out var cdo) || cdo is not { } defaults) return;
 
             // The CDO's own root component, then any static-mesh-shaped property hanging off it.
-            if (MeshOf(defaults) is { } direct) return direct;
+            if (MeshOf(defaults) is { } direct) found.Add(direct);
 
             foreach (var property in defaults.Properties)
             {
                 var value = property.Tag?.GenericValue;
                 if (value is FPackageIndex index && index.TryLoad(out var loaded) && MeshOf(loaded) is { } fromProperty)
-                    return fromProperty;
+                    found.Add(fromProperty);
             }
         }
         catch (Exception e)
         {
             Log.Debug("CDO probe failed for {Name}: {Message}", blueprint.Name, e.Message);
         }
-
-        return null;
     }
 
     /// <summary>The static mesh a component points at, as a path string - never loading the mesh itself.</summary>

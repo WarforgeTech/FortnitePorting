@@ -476,27 +476,71 @@ paid for 26,620 times. `sz` is the static mesh's render bounds in whole centimet
 lowercased, which is what makes plain English hit an asset called `BP_Helios_JuniperHedge_Straight`.
 
 `galleries.jsonl` rows are `{id, name, asset, sc, n, src, kw}`; a gallery's contents are found by
-grepping its `id` in `props-*.jsonl`, so the member list is never stored twice.
+grepping its `id` in `props-full.jsonl`, so the member list is never stored twice.
+
+## Picking the mesh: proxies are not the visual
+
+A blueprint usually names several static meshes and the first one is frequently a **shadow proxy** —
+a featureless silhouette used for shadow casting. Serving that as `sm` is actively harmful: it
+measures roughly right, so nothing looks broken, but `CaptureAssetImage` renders it as a dark blob
+and the agent shows the user a picture of nothing. The walk therefore collects **all** candidates
+(SCS, then inherited component records, then the CDO, then the parent class when the child produced
+nothing usable) and prefers the first whose leaf name does not read as a proxy.
+
+**174 rows changed mesh** as a result — overwhelmingly foliage, which is where proxies live:
+
+| was | now | rows |
+| --- | --- | ---: |
+| `BigBushShadowProxy` | `BigBush` | 8 |
+| `BigBushShadowProxy` | `CP_BigBush` | 6 |
+| `SM_Hermes_Beech_Tree_fallback_Shadowproxy` | `SM_Hermes_GinkgoBiloba_Tree_Bake` | 6 |
+| `Birch_ShadowProxy_Combined` | `SM_Birch_Bake` | 5 |
+| `MediumAlder_ShadowProxy_Combined` | `SM_MediumAlder_Bake` | 5 |
+| `SM_WhiteOak_fallback_shadowproxy` | `SM_Hermes_WhiteOak_Tree_A_Bake` | 5 |
+
+Their `sz` moved with them (174 rows), because the real mesh is measurably bigger than its proxy —
+`Apollo_BigBush` went `[1142, 1125, 785]` → **`[1148, 1222, 863]`**. The proxy was understating the
+bush by 78 cm of height.
+
+When *every* candidate is a proxy, `sm` is nulled (a blob preview is worse than none) but `sz` is
+still measured from the proxy and `dump-report.log` names the suppressed mesh. **That case does not
+occur on 42.00** — the count is 0.
+
+The name list was narrowed twice, by measurement rather than taste:
+
+* `blockout` and `_lod` were tried and removed: they caused **348 of 351** suppressions, and both
+  are real geometry a builder places deliberately — Blockout is an intentional grey-box prop family,
+  and an LOD mesh renders the same silhouette at lower detail.
+* `collision` was tried and removed: its only two hits on the entire archive were
+  `Creative_Helipad_NoCollision` and `PlayGround_MerryGoRound_01_collisionFix`, both real visual
+  meshes whose names merely contain the word. A substring rule cannot tell a collision hull from a
+  mesh named after *not* having one, so it no longer tries.
+
+What remains is `proxy` and `shadowcaster`, which are unambiguous.
 
 ## Pipeline and what each phase costs
 
 Measured on Fortnite **42.00**, 569,456 registry rows, 12-way parallel, warm name-index cache.
-Archive mount (4.6 s) is excluded; it is the same mount every CLI mode pays.
+Archive mount (~4.7 s) is excluded; it is the same mount every CLI mode pays.
 
 | phase | what it does | tier b / bounds core |
 | --- | --- | ---: |
 | P1 canonical | `AssetQuery.CanonicalAsync(Prop)` — 105,512 registry rows → 26,620 deduped (78,892 folded) | 0.5 s |
-| P2 galleries | all 2,169 `FortPlaysetItemDefinition`, one package load each; members read as `FSoftObjectPath` **strings** and joined by path (never `TryLoad`ed) | 2.7 s |
-| P3 placement | per prop: one package load, `ActorSaveRecord` → `TemplateRecords[*].ActorClass` soft path → `_C` class path | 56.2 s |
-| P4 mesh + bounds | blueprint load → SCS / `InheritableComponentHandler` / CDO / parent-class walk → first `StaticMesh`; mesh load for render bounds | (same pass) |
+| P2 galleries | all 2,169 `FortPlaysetItemDefinition`, one package load each; members read as `FSoftObjectPath` **strings** and joined by path (never `TryLoad`ed) | 2.2 s |
+| P3 placement | per prop: one package load, `ActorSaveRecord` → `TemplateRecords[*].ActorClass` soft path → `_C` class path | 69.1 s |
+| P4 mesh + bounds | blueprint load → collect every static mesh across SCS / `InheritableComponentHandler` / CDO / parent class → prefer a non-proxy → mesh load for render bounds | (same pass) |
 | P5 scopes | distinct mount prefixes, merged with `Config/mount-verification.json` | 0.2 s |
-| P6 write | seven files | 5.2 s |
-| **total** | | **64.9 s** |
+| P6 write | six files | 4.9 s |
+| **total** | | **77.5 s** |
 
-`--tier a --bounds none` (no mesh loads, no bounds) writes the same row set in **43.7 s**. Tier
-controls the blueprint/mesh hop; `--bounds` controls the separate static-mesh load that measures it.
+Collecting every mesh candidate instead of short-circuiting on the first cost **+12.6 s** (64.9 s →
+77.5 s), which buys the 174 corrected meshes above.
 
-Loading gallery members as strings rather than `TryLoad`ing them is what keeps P2 at 2.7 s: a
+`--tier a --bounds none` skips the mesh loads entirely. Tier controls the blueprint/mesh hop;
+`--bounds` controls the separate static-mesh load that measures it. The "core" subset (gallery
+members ∪ curated name families) no longer has a file of its own but still gates both flags.
+
+Loading gallery members as strings rather than `TryLoad`ing them is what keeps P2 at ~2 s: a
 gallery's members are props P3 opens anyway, so loading them here would double the archive work for
 nothing. The save-record-collection walk is kept only as a fallback for galleries whose
 `AssociatedPlaysetProps` is empty — merging both sources unconditionally double-counts every prop.
@@ -525,33 +569,36 @@ per row saying why.
 * **Spot row — JuniperHedge straight.** `ppid` is the known `/Burd_Comp` PPID, `bp` ends
   `.BP_Helios_JuniperHedge_Straight_C`, `sm` is
   `/Game/Environments/Asteria/Foliage/Hedges/JuniperHedges/Meshes/SM_JuniperHedge_straight_fallback`,
-  `sz` **`[439, 226, 211]`** — the expected value exactly. Full row above.
+  `sz` **`[439, 226, 211]`** — the expected value exactly, and **unchanged** by the proxy fix. Full
+  row above.
 * **Spot row — Apollo_BigBush.** `bp`
   `/Game/Athena/Apollo/Environments/BuildingActors/Foliage/Apollo_BigBush.Apollo_BigBush_C`, `sm`
-  `/Game/Environments/Apollo/Foliage/BigBush/Meshes/BigBushShadowProxy`, `sz` `[1142, 1125, 785]`,
-  6 galleries.
+  **`/Game/Environments/Apollo/Foliage/BigBush/Meshes/BigBush`** (was `.../BigBushShadowProxy`),
+  `sz` `[1148, 1222, 863]`, 6 galleries.
 * **Spot row — Battlewood Boulevard Nature Gallery.** `n: 52`, `src: "associated"` — the expected
   member count.
 * **Grep tests.** `grep -i hedge props-full.jsonl` → **109** rows (target >20).
   `grep -i battlewood galleries.jsonl` → **8** (target 8).
 * **Determinism.** Two consecutive dumps into different directories: `atlas.md`, `scopes.tsv`,
-  `galleries.jsonl`, `props-core.jsonl`, `props-full.jsonl` and `dump-report.log` **byte-identical**;
-  `META.json` differs only in `generatedUtc`. Rows are sorted `(name, ppid)`, ids are handed out
-  after the sort, scope ids are stable and sorted by UEFN path, and keyword lists are sorted.
-* **`--selftest` PASSED in 4.9 s**, 12 tools registered.
+  `galleries.jsonl`, `props-full.jsonl` and `dump-report.log` **byte-identical**; `META.json`
+  differs only in `generatedUtc`. Rows are sorted `(name, ppid)`, ids are handed out after the sort,
+  scope ids are stable and sorted by UEFN path, and keyword lists are sorted.
+* **`--selftest` PASSED**, 12 tools registered.
 
 ## Sizes
 
 | file | raw bytes | gzip -9 |
 | --- | ---: | ---: |
-| `META.json` | 420 | 272 |
-| `atlas.md` | 35,449 | 10,941 |
-| `scopes.tsv` | 28,212 | 8,465 |
+| `META.json` | 395 | 264 |
+| `atlas.md` | 35,580 | 10,974 |
+| `scopes.tsv` | 28,212 | 8,466 |
 | `galleries.jsonl` | 550,684 | 68,902 |
-| `props-core.jsonl` | 18,374,034 | 1,812,201 |
-| `props-full.jsonl` | 18,486,006 | 1,823,279 |
+| `props-full.jsonl` | 18,483,308 | 1,822,768 |
 | `dump-report.log` | 206,805 | 20,385 |
-| **total** | **37,681,610** | **3,743,517** (whole dir, deflate) |
+| **total** | **19,304,984** | **1,931,705** (whole dir, deflate) |
+
+Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,304,984 raw, 3,743,517 → 1,931,705
+zipped.
 
 ## Mount verification
 
@@ -571,17 +618,20 @@ not just its PPID's. Without that, neither verified mount would appear in the ta
 PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in shared
 environment content (`/Game/Environments`), and it is the second one an agent scopes a search to.
 
+## Dropped: `props-core.jsonl`
+
+The original design shipped a second, denser row file — gallery members ∪ curated name families.
+It was built, measured at **26,402 of 26,620 rows (99.2%)**, and removed. 26,237 props belong to at
+least one gallery (86,665 membership links), so the union degenerates to "almost everything".
+Narrower cuts were measured and do not help either: restricting to galleries whose *name* contains
+"Gallery" still gives 25,013, and deduplicating by blueprint gives 26,454 distinct blueprints out of
+26,620 rows because `CanonicalAsync` had already folded the 78,892 clones away. Only
+curated-families-only (12,991) halves it, and that trades away the coverage this dump exists for.
+The subset still exists internally as the `--tier`/`--bounds` gate; it just no longer costs 18 MB to
+say the same thing twice.
+
 ## Left open
 
-* **`props-core.jsonl` is 99.2% of `props-full.jsonl` (26,402 of 26,620) and earns nothing.** The
-  specified definition is "gallery members ∪ curated families", and it was measured: 26,237 of
-  26,620 props belong to at least one gallery (86,665 membership links), so the union degenerates to
-  "almost everything". Narrower definitions were measured too and do not help — restricting to
-  galleries whose *name* contains "Gallery" still gives 25,013; deduplicating by blueprint gives
-  26,454 distinct blueprints out of 26,620 rows, because `CanonicalAsync` already folded the 78,892
-  clones away. The generated atlas now says this in its file table and tells the reader to grep
-  `props-full.jsonl` instead. **CE-3 should either drop `props-core.jsonl` or redefine it** —
-  curated-families-only is 12,991 rows and is the only cut measured that halves the file.
 * **`name` is the game's own display name, which for creative props is usually an engineering name**
   (`BP_Helios_JuniperHedge_Straight`, `Apollo_BigBush`). It is left verbatim rather than prettified,
   because it is the string the archive actually holds; `kw` is what carries the plain English.
@@ -589,9 +639,12 @@ environment content (`/Game/Environments`), and it is the second one an agent sc
   per-prop placement footprint that would cover rows whose mesh never resolves. It was implemented,
   measured, found dead, and removed — a `PropMeshResolver` comment records the measurement so nobody
   tries it again. Rows without a mesh therefore ship with no size at all.
-* **`sm` is the *first* static mesh a blueprint exposes**, not all of them. A multi-mesh prop (a shed
-  plus its door) gets one representative mesh and that mesh's bounds, which can understate the
-  prop's true footprint.
+* **`sm` is one representative mesh, not all of them.** The walk now prefers a non-proxy, but a
+  multi-mesh prop (a shed plus its door) still reports a single mesh and that mesh's bounds, which
+  can understate the prop's true footprint.
+* **Proxy detection is a name heuristic.** A shadow proxy that is not named like one is served as
+  the visual, and a real mesh with "proxy" in its name would be skipped. Both were measured on
+  42.00 and neither occurs, but neither is structurally ruled out.
 * **Bounds are the mesh's, not the actor's.** Component transforms in the blueprint (scale, offset)
   are not applied, so a prop whose SCS scales its mesh reports the unscaled size.
 * **Only `Prop` is indexed.** Prefabs appear as galleries (name + membership + scope) but have no

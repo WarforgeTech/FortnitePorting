@@ -66,9 +66,11 @@ public sealed class AssetIndexDumper(
     DisplayNameIndex names)
 {
     /// <summary>
-    /// Name families a builder reaches for constantly. A prop matching one is pulled into
-    /// props-core.jsonl even when no gallery references it, because gallery membership alone leaves
-    /// out most of the environment kit.
+    /// Name families a builder reaches for constantly. Together with gallery membership these mark
+    /// the "core" subset, which no longer gets a file of its own - it was measured at 99.2% of the
+    /// full list, because nearly every prop belongs to some gallery - but still gates the expensive
+    /// hops: <c>--tier a</c> resolves blueprints and meshes for core rows only, and
+    /// <c>--bounds core</c> measures only those.
     /// </summary>
     private static readonly string[] CuratedFamilies =
     [
@@ -138,11 +140,10 @@ public sealed class AssetIndexDumper(
         var rows = await BuildPropRowsAsync(options, canonical.Items, galleries, failures, token);
         timings["P3/P4 props"] = phase.Elapsed;
 
-        var coreRows = rows.Where(row => row.IsCore).Select(row => row.Row).ToList();
         var fullRows = rows.Select(row => row.Row).ToList();
 
         Log.Information("[INDEX] P3/P4: {Full:N0} rows ({Core:N0} core), {Bp:N0} with a blueprint, {Sm:N0} with a mesh, {Sz:N0} with a size, in {Seconds:N1}s",
-            fullRows.Count, coreRows.Count,
+            fullRows.Count, rows.Count(row => row.IsCore),
             fullRows.Count(row => row.Bp is not null), fullRows.Count(row => row.Sm is not null),
             fullRows.Count(row => row.Sz is not null), phase.Elapsed.TotalSeconds);
 
@@ -160,8 +161,11 @@ public sealed class AssetIndexDumper(
             .ThenBy(row => row.Asset, StringComparer.Ordinal)
             .ToList();
 
+        // props-core.jsonl used to sit beside this one, carrying gallery members plus curated
+        // families. It was measured at 99.2% of props-full on 42.00 - nearly every prop belongs to
+        // some gallery - so it cost 18 MB to say the same thing twice and was dropped. The core
+        // subset still exists as the tier/bounds gate; it just no longer earns a file.
         var fullCount = await IndexWriters.WriteJsonLinesAsync(Path.Combine(indexDirectory, "props-full.jsonl"), fullRows);
-        var coreCount = await IndexWriters.WriteJsonLinesAsync(Path.Combine(indexDirectory, "props-core.jsonl"), coreRows);
         var galleryCount = await IndexWriters.WriteJsonLinesAsync(Path.Combine(indexDirectory, "galleries.jsonl"), galleryRows);
         await IndexWriters.WriteScopesAsync(Path.Combine(indexDirectory, "scopes.tsv"), scopes);
         await WriteFailuresAsync(Path.Combine(indexDirectory, "dump-report.log"), failures);
@@ -169,7 +173,6 @@ public sealed class AssetIndexDumper(
         var counts = new IndexCounts
         {
             FullRows = fullCount,
-            CoreRows = coreCount,
             Galleries = galleryCount,
             Scopes = scopes.Count,
             Failures = failures.Count
@@ -195,7 +198,6 @@ public sealed class AssetIndexDumper(
             files = new
             {
                 propsFull = fullCount,
-                propsCore = coreCount,
                 galleries = galleryCount,
                 scopes = scopes.Count,
                 failures = failures.Count
