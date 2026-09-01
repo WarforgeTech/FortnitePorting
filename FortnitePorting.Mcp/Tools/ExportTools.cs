@@ -36,7 +36,11 @@ public static class ExportTools
     [McpServerTool(Name = "export_assets", Destructive = false, OpenWorld = false)]
     [Description("Exports one or more Fortnite assets (props, outfits, meshes, textures, sounds, ...) to disk. "
                  + "Meshes land as .uemodel/.psk/.glb next to their PNG/TGA textures. Returns the exact file list written per asset, "
-                 + "the style variants applied, and - for outfits/backpacks - the character parts (head, body, hat, ...) that came out.")]
+                 + "the style variants applied, and - for outfits/backpacks - the character parts (head, body, hat, ...) that came out. "
+                 + "Each asset also gets a <AssetName>.manifest.json (path returned as manifestPath) listing the render mesh to import "
+                 + "(primaryMesh - never the shadow proxy) and, per material slot, every texture parameter name with its exported file, "
+                 + "plus scalar/vector/switch parameters. Exported meshes carry NO texture bindings, so read the manifest rather than "
+                 + "guessing slot->texture from file names.")]
     public static async Task<CallToolResult> ExportAssetsAsync(
         IServiceProvider services,
         [Description("Full object paths to export, e.g. 'FortniteGame/Content/.../PID_Foo.PID_Foo'.")]
@@ -91,8 +95,9 @@ public static class ExportTools
 
     [McpServerTool(Name = "export_gallery", Destructive = false, OpenWorld = false)]
     [Description("Exports a Creative gallery/prefab (FortPlaysetItemDefinition). With perAssetFolders=true (default) every member prop "
-                 + "is exported on its own into <outputDir>/<GalleryName>/<PropName>/ so each folder holds one mesh plus its textures - "
-                 + "ready for individual UEFN import. With perAssetFolders=false the whole gallery is exported as one composed prefab.")]
+                 + "is exported on its own into <outputDir>/<GalleryName>/<PropName>/ so each folder holds one mesh plus its textures "
+                 + "plus a manifest.json (render mesh + material slot -> texture parameter bindings) - ready for individual UEFN import. "
+                 + "With perAssetFolders=false the whole gallery is exported as one composed prefab.")]
     public static async Task<CallToolResult> ExportGalleryAsync(
         IServiceProvider services,
         [Description("Full object path of the gallery's FortPlaysetItemDefinition. Provide this or galleryName.")]
@@ -598,6 +603,18 @@ public static class ExportTools
                     ["bytes"] = file.Bytes
                 }).ToArray())
         };
+
+        // The manifest is the machine-readable answer to "which file do I import, and which texture
+        // goes in which material slot" - neither of which survives into the exported mesh files.
+        if (asset.ManifestPath is not null) json["manifestPath"] = asset.ManifestPath;
+        if (asset.PrimaryMeshFile is not null)
+        {
+            json["primaryMesh"] = asset.PrimaryMeshFile;
+            json["primaryMeshPath"] = asset.PrimaryMeshPath;
+        }
+
+        if (asset.ManifestNotes.Count > 0)
+            json["manifestNotes"] = ToolResults.ToJsonArray(asset.ManifestNotes);
 
         if (asset.AppliedStyles.Count > 0)
             json["appliedStyles"] = ToolResults.ToJsonArray(asset.AppliedStyles);

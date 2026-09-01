@@ -43,6 +43,15 @@ public record ExportOptions
     /// folder export (AssetInfo.GetAllStyles).
     /// </summary>
     public StyleSelection? Styles { get; init; }
+
+    /// <summary>
+    /// File name for the per-asset manifest. Null uses "&lt;AssetName&gt;.manifest.json"; the
+    /// gallery path sets "manifest.json" because each prop already owns its folder.
+    /// </summary>
+    public string? ManifestFileName { get; init; }
+
+    /// <summary>Set false to skip manifest generation entirely (geometry-only exports).</summary>
+    public bool WriteManifest { get; init; } = true;
 }
 
 public record ExportedFile(string Path, long Bytes);
@@ -70,6 +79,22 @@ public record ExportedAsset
     /// warning and carries on, so an emote could report success with no animation in it.
     /// </summary>
     public List<string> MissingArtifacts { get; init; } = [];
+
+    /// <summary>
+    /// Absolute path of the per-asset manifest.json describing material -&gt; texture-parameter
+    /// bindings and which mesh file is the render mesh. Null only when manifest writing was
+    /// disabled or failed.
+    /// </summary>
+    public string? ManifestPath { get; init; }
+
+    /// <summary>File name of THE mesh to import - never a shadow proxy, collision hull or LOD.</summary>
+    public string? PrimaryMeshFile { get; init; }
+
+    /// <summary>Absolute path of <see cref="PrimaryMeshFile"/>.</summary>
+    public string? PrimaryMeshPath { get; init; }
+
+    /// <summary>Machine-readable manifest flags (shadow_proxy_present, unreferenced_texture_files, ...).</summary>
+    public List<string> ManifestNotes { get; init; } = [];
 
     public long Bytes => Files.Sum(file => file.Bytes);
 }
@@ -218,7 +243,8 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             var propDir = IoPath.Combine(root, folderName);
             Directory.CreateDirectory(propDir);
 
-            var propOptions = opts with { OutputDir = propDir };
+            // Each prop owns its folder, so the manifest gets the plain, predictable name there.
+            var propOptions = opts with { OutputDir = propDir, ManifestFileName = "manifest.json" };
             var single = await ExportOne(member.Object, member.ObjectPath, propOptions, token);
 
             if (single.Failure is not null) result.Failures.Add(single.Failure);
@@ -457,6 +483,27 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 Log.Warning("Export of {Name} ({Type}) is missing primary artifacts: {Missing}",
                     displayName, exportType, string.Join(" ", missing));
 
+            // The manifest is written last so it can report what actually landed on disk, and is
+            // then folded into the file list so the caller's file count stays truthful.
+            ExportManifestResult? manifest = null;
+            if (opts.WriteManifest && files.Count > 0)
+            {
+                manifest = await ExportManifest.WriteAsync(
+                    export, meta,
+                    objectPath: asset.GetPathName(),
+                    assetName: asset.Name,
+                    displayName: displayName,
+                    exportType: exportType.ToString(),
+                    outputRoot: outputRoot,
+                    files: files,
+                    appliedStyles: appliedStyles,
+                    manifestFileName: opts.ManifestFileName,
+                    resolveObject: path => loader.Provider.SafeLoadPackageObjectAsync(ExportSession.FixPath(path)));
+
+                if (manifest is not null && files.All(file => !file.Path.Equals(manifest.Path, StringComparison.OrdinalIgnoreCase)))
+                    files.Add(new ExportedFile(manifest.Path, manifest.Bytes));
+            }
+
             return new SingleExport(new ExportedAsset
             {
                 ObjectPath = asset.GetPathName(),
@@ -467,7 +514,11 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 AppliedStyles = appliedStyles,
                 Parts = DescribeParts(export),
                 MissingArtifacts = missing,
-                Notes = CollectNotes(missing)
+                Notes = CollectNotes(missing),
+                ManifestPath = manifest?.Path,
+                PrimaryMeshFile = manifest?.PrimaryMeshFile,
+                PrimaryMeshPath = manifest?.PrimaryMeshPath,
+                ManifestNotes = manifest?.Notes ?? []
             }, null);
         }
         catch (Exception e)
@@ -657,7 +708,7 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
         }
     }
 
-    private static IEnumerable<ExportMesh> EnumerateMeshes(MeshExport export)
+    internal static IEnumerable<ExportMesh> EnumerateMeshes(MeshExport export)
     {
         var queue = new Queue<ExportMesh>(export.Meshes.Concat(export.OverrideMeshes));
         while (queue.Count > 0)
@@ -803,7 +854,7 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
         return parts;
     }
 
-    private static string ToDiskPath(string objectPath, string extension, ExportDataMeta meta)
+    internal static string ToDiskPath(string objectPath, string extension, ExportDataMeta meta)
     {
         string relative;
         if (meta.CustomPath is not null)

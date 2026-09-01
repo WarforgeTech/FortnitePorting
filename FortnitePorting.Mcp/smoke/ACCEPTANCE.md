@@ -257,3 +257,105 @@ Every other category is unchanged.
   the shared exporter, so a GUI export still swallows the same failures.
 * Vehicle `tags[]` is still empty: vehicle DataLists carry `Traits`, not the `Tags` container the shared
   gameplay-tag handler reads. Left alone rather than guessing at the struct shape.
+
+---
+
+# Export manifest round (2026-08-31, later same day)
+
+Driven by the UEFN import validation run (`FortniteAssetExports/_uefn_staging/_validation/RESULTS.md`), whose
+9/9 structural PASS sat next to 4 WARN + 1 FAIL on colour fidelity. Every one of those traced to information
+CUE4Parse **has in memory** and the export **throws away**:
+
+* Gltf2 writes material *names* with every `baseColorTexture` / `normalTexture` **null** — no slot to texture link.
+* Exported PNGs are alpha=255 everywhere; foliage opacity lives in a separate `_M` / `_Mask` texture.
+* Apollo foliage colour lives in a LUT texture and in base-material colour defaults, not in the diffuse (which is ~white).
+* `CP_Apollo_BigBush` exports a shadow proxy that sorts **alphabetically before** the render mesh.
+
+`export_assets` / `export_gallery` now write a per-asset `*.manifest.json` (`manifest.json` inside each
+gallery prop folder) built from the live `BaseExport` -> `ExportMesh` -> `ExportMaterial` model, and return its
+path. Nothing existing was renamed; all fields are additions.
+
+## Results
+
+| # | Check | Result | Evidence |
+|---|---|---|---|
+| M1 | `CP_Apollo_BigBush` -> manifest exists, render mesh correct | PASS | `primaryMesh = CP_BigBush.glb` (**not** `BigBushShadowProxy.glb`, which is classified `role: "shadow_proxy"`); asset note `shadow_proxy_present`. |
+| M2 | BigBush materials list the LUT and the tints | PASS | `CP_M_BigBush.roles.lut = "ColorPalette"` -> `Apollo_Foliage_LUT_MountainPines.png`; `baseMaterialDefaults` carries `Color1_Base #7C813A`, `Color2_Lit #545B21`, `Color3_Shadows #35461C` — the olive green missing from the white-bush FAIL. Material notes: `masked_blend`, `opacity_in_mask_texture`, `color_via_lut`. |
+| M3 | Every referenced texture file exists on disk | PASS | 9/9 referenced textures present for BigBush; `textureFiles.referencedButMissing = []` on all four test assets. |
+| M4 | JuniperHedge prop shows Diffuse / Normals / mask params | PASS | `MI_JuniperHedges_leaf_fallback` (BLEND_Masked, twoSided) -> `Diffuse` = `JuniperTree_needle_diffuse.png`, `Normals` = `JuniperTree_needle_normal.png`, `MaskTexture` = `JuniperTree_needle_OSSR.png`. Second slot `MI_JuniperHedges_leaf_fallback_core` (BLEND_Opaque) — the two "orphan" MIs the validation run could not place. |
+| M5 | Weapon export | PASS | `WID_Assault_AutoHigh_Athena_BB_R` -> `primaryMesh = SK_SCAR.glb`, slot 0 `MI_Sniper_Scar_Inst` with `Diffuse` / `Normals` / `SpecularMasks` / `CustomizationMask (_CM)`. Manifest 27 KB, valid JSON. |
+| M6 | Outfit export | PASS | `CID_028_Athena_Commando_F` -> 3 render meshes (Body / Head / Hat) + 1 `role: "skeleton"`; `primaryMesh = null` with notes `multiple_render_meshes`, `import_all_render_meshes`; every part's slots carry `Diffuse` / `M` / `Normals` / `SpecularMasks`. Export status `partial` is the pre-existing `.uepose`-in-Gltf2 gap, unrelated. |
+| M7 | LOD / proxy sidecars accounted for | PASS | `CP_BigBush_LOD2/LOD3.glb` attach to the render mesh, `BigBushShadowProxy_LOD1.glb` to the proxy; `unaccountedMeshFiles = []` on all four assets. |
+| M8 | `export_gallery` per-prop manifests | PASS | "DustHaven Tent" -> 7/7 prop folders each hold `manifest.json` with its own `primaryMesh`; "Crime City Wall Gallery" 475/475 props, 10,529 files, manifests throughout. |
+| M9 | `--selftest`, build, publish | PASS | self-test PASSED in 5.5 s, 12 tools; `dotnet build -c Release` 0 errors; `dotnet publish -c Release -o publish\mcp` clean. |
+
+## Sample manifest (trimmed — `PPID_CR_Legacy_CP_Apollo_BigBush.manifest.json`)
+
+```json
+{
+  "schemaVersion": 1,
+  "asset": {
+    "objectPath": "/CR_Legacy/Playsets/PlaysetProps/PPID_CR_Legacy_CP_Apollo_BigBush.PPID_CR_Legacy_CP_Apollo_BigBush",
+    "displayName": "CP_Apollo_BigBush",
+    "exportType": "Prop",
+    "sourceBoundsCm": { "sizeX": 1102.85, "sizeY": 1124.72, "sizeZ": 785.12, "units": "cm" }
+  },
+  "primaryMesh": "CP_BigBush.glb",
+  "meshes": [
+    { "name": "BigBushShadowProxy", "file": "BigBushShadowProxy.glb", "role": "shadow_proxy", "isPrimary": false,
+      "sidecarFiles": [ { "file": "BigBushShadowProxy_LOD1.glb", "kind": "lod", "lodIndex": 1 } ] },
+    { "name": "Default__CP_Apollo_BigBush_C", "file": "CP_BigBush.glb", "role": "render", "isPrimary": true, "numLods": 3,
+      "sidecarFiles": [ { "file": "CP_BigBush_LOD2.glb", "kind": "lod", "lodIndex": 2 },
+                        { "file": "CP_BigBush_LOD3.glb", "kind": "lod", "lodIndex": 3 } ],
+      "materials": [
+        { "slot": 0, "name": "CP_M_BigBush", "blendMode": "BLEND_Masked", "twoSided": true,
+          "roles": { "diffuse": "Diffuse", "normal": "Normals", "mask": "MaskTexture", "lut": "ColorPalette" },
+          "textures": [
+            { "parameter": "ColorPalette", "file": "Apollo_Foliage_LUT_MountainPines.png", "sRGB": true,  "compressionSettings": "TC_Default" },
+            { "parameter": "Diffuse",      "file": "T_Apollo_Medium_Leaf_D_Clr.png",       "sRGB": true,  "compressionSettings": "TC_Default" },
+            { "parameter": "MaskTexture",  "file": "T_Apollo_Medium_Leaf_MASK.png",        "sRGB": false, "compressionSettings": "TC_Masks" },
+            { "parameter": "Normals",      "file": "T_Apollo_Medium_Leaf_N.png",           "sRGB": false, "compressionSettings": "TC_Normalmap" }
+          ],
+          "baseMaterialDefaults": { "vectorCount": 37, "truncated": true, "vectors": [
+            { "name": "Color1_Base",    "hex": "7C813A" },
+            { "name": "Color2_Lit",     "hex": "545B21" },
+            { "name": "Color3_Shadows", "hex": "35461C" } ] },
+          "notes": [ "masked_blend", "opacity_in_mask_texture", "color_via_lut" ] } ] }
+  ],
+  "textureFiles": { "unreferencedOnDisk": [] },
+  "notes": [ "shadow_proxy_present" ]
+}
+```
+
+Tool output gained `manifestPath`, `primaryMesh`, `primaryMeshPath` and `manifestNotes` per asset; the manifest
+file is also folded into `files[]` so `fileCount` stays truthful.
+
+## Design notes
+
+* **Nothing is faked into the pixels.** Diffuse PNGs are still written exactly as the exporter produces them
+  (alpha 255). The manifest names which texture *parameter* drives opacity instead — `roles.mask` plus the
+  `opacity_in_mask_texture` note — because writing invented alpha would corrupt the source data.
+* **`primaryMesh` is asserted only when it is true.** One render-role mesh -> it is named. Several (an outfit's
+  head/body/hat) -> `primaryMesh` is `null`, `primaryMeshCandidates` gives the ranking, and
+  `import_all_render_meshes` says what to do. Shadow proxies, collision hulls, `*Skeleton` and LOD meshes are
+  classified out of the render pool by `ExportManifest.ClassifyMesh`.
+* **Base-material defaults are capped at 48 vectors / 48 scalars** (`DefaultsCap`), colour- and surface-looking
+  names ranked first, with `vectorCount` / `scalarCount` / `truncated` reported. Uncapped, a Fortnite weapon
+  uber-shader emitted 4,936 colours and 9,528 scalars — a 2.2 MB manifest. Capped it is 27 KB, and the BigBush
+  tints still survive the cull. `get_properties_json` remains the route to the full set.
+* **`FortnitePorting.Exporting` is untouched.** Two `ExportRunner` helpers (`ToDiskPath`, `EnumerateMeshes`)
+  went from `private` to `internal`; that is the whole footprint outside the new file.
+* **Manifest failure never fails an export.** `ExportManifest.WriteAsync` catches, logs a warning and returns
+  null; the export still reports its files.
+
+## Left open
+
+* **`sourceBoundsCm` is UE's authored `FBoxSphereBounds`**, not the tight bounds of the exported geometry.
+  JuniperHedge reports 439.3 / 226.1 / 210.9 cm where Blender measures the exported mesh at 436.2 / 209.7 /
+  201.6 cm. Use it as a sanity check, not as an import scale reference.
+* **Vector parameters on a material instance are overrides only.** `CP_M_BigBush` overrides no colours, so its
+  `vectors[]` is empty; the tints come from `baseMaterialDefaults`. Consumers must read both.
+* **Manifests are large for multi-material assets** (BigBush 91 KB, outfit 164 KB). They are meant to be parsed,
+  not pasted into a prompt — read `primaryMesh` and `meshes[].materials[].textures[]` and ignore the rest.
+* **1x1 placeholder textures are flagged, not skipped.** Each texture entry carries `bytes` and
+  `placeholder: true` under 512 bytes; the exporter still writes them.
