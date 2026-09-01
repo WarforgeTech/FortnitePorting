@@ -53,11 +53,28 @@ public sealed record PropRow
     /// <summary>Creative category, from the prop's own creative tags.</summary>
     [JsonPropertyName("cat")] public string? Cat { get; init; }
 
+    /// <summary>
+    /// Present and true when the name marks this as one unit of a larger assembly (a quarter, a
+    /// half, a corner, a segment, a piece). Absent otherwise - it is never written false.
+    /// </summary>
+    [JsonPropertyName("frag")] public bool? Frag { get; init; }
+
     /// <summary>Gallery ids this prop is a member of.</summary>
     [JsonPropertyName("gal")] public List<string> Gal { get; init; } = [];
 
-    /// <summary>Lowercase search tokens: name, asset name, gallery names, theme, creative tags.</summary>
+    /// <summary>
+    /// HIGH-PRECISION tokens: the asset's own display name and asset name, its theme, and its
+    /// creative tags. Search this first - every token here describes what the asset actually is.
+    /// </summary>
     [JsonPropertyName("kw")] public List<string> Kw { get; init; } = [];
+
+    /// <summary>
+    /// RECALL tokens: the names of the galleries this prop appears in, minus anything already in
+    /// <see cref="Kw"/>. Widens a search that found nothing, at the cost of precision - a gallery
+    /// name lands on every one of its members, so these describe the company an asset keeps rather
+    /// than the asset itself. Absent when it would add nothing.
+    /// </summary>
+    [JsonPropertyName("gkw")] public List<string>? Gkw { get; init; }
 }
 
 /// <summary>One creative gallery. Members are found by grepping props-full.jsonl for the gallery id.</summary>
@@ -168,6 +185,34 @@ public static class IndexWriters
         }
     }
 
+    /// <summary>
+    /// Plain-English gloss for one <c>verified</c> column value, composed from its verbs.
+    /// <para>
+    /// Generated rather than hand-listed because the hand-written version drifted: a consumer's
+    /// documentation claimed three statuses while the file shipped six, leaving an agent to guess
+    /// what <c>resolve+place</c> meant and whether <c>find</c> was safe to place from.
+    /// </para>
+    /// </summary>
+    private static string ExplainStatus(string label)
+    {
+        if (label == "missing")
+            return "**`find_assets` returned nothing.** The mount is not exposed in the UEFN content browser at all - see below. This is the only status that is a stop sign.";
+
+        if (label == "unverified")
+            return "Nobody has asked the editor about this mount. **Untested, not broken** - this dump can prove a path exists in the archive, never that UEFN will accept it. Placing from these works in practice.";
+
+        var verbs = label.Split('+', StringSplitOptions.RemoveEmptyEntries).Select(verb => verb switch
+        {
+            "find" => "`find_assets` returned rows there",
+            "capture" => "`CaptureAssetImage` rendered a **textured** preview (a grey render is recorded as `find` instead)",
+            "place" => "`add_to_scene_from_asset` placed an actor",
+            "resolve" => "a PPID placement auto-resolved to its creative prop blueprint",
+            _ => $"`{verb}` was observed"
+        });
+
+        return "Confirmed: " + string.Join("; ", verbs) + ".";
+    }
+
     /// <summary>A note is free text from an operator; a stray tab or newline would break the row.</summary>
     private static string Flatten(string? value)
         => string.IsNullOrWhiteSpace(value)
@@ -225,11 +270,16 @@ public static class IndexWriters
 
             ## The flow
 
-            1. **Human words -> rows.** `grep -i hedge index/props-full.jsonl`. Every row carries
-               `kw`, lowercase tokens from its display name, its gallery names, its theme and its
-               creative tags, so plain English hits even when the asset is called
-               `BP_Helios_JuniperHedge_Straight`. **If the row has a `reach` field, read it first** -
-               it tells you which of the steps below are actually available for that asset.
+            1. **Human words -> rows. Search `kw` first, `gkw` only if that fails.** `kw` holds
+               lowercase tokens from the asset's OWN name, its theme and its creative tags, so a
+               `kw` hit means the asset really is the thing you asked for even when it is called
+               `BP_Helios_JuniperHedge_Straight`. `gkw` holds the names of the galleries it appears
+               in - pure recall, and imprecise by construction, because a gallery called
+               `..._Prefab_Greenhouse` puts `greenhouse` on all 111 of its members including a
+               boombox and a plate of tacos. Compound names are indexed both ways: `PrincessCastle`
+               is searchable as `princess`, as `castle` and as `princesscastle`.
+               **If the row has a `reach` field, read it first** - it tells you which of the steps
+               below are actually available for that asset.
             2. **Row -> scoped search.** Often unnecessary - the row already holds exact paths. When
                you want to browse siblings, take the folder half of the row's `bp` or `sm` (or its
                scope's UEFN path from `scopes.tsv`, joined on `sc`) and call
@@ -260,12 +310,72 @@ public static class IndexWriters
             | **Scope every `find_assets` call** with `folder_path`. | Verified working scoped, e.g. `folder_path='/Game/Environments', name='JuniperHedge'`. |
             | **Reachability is per-identity.** An identity works only if its own scope is not `missing` - and a missing mount blocks **placement too**, not just search. | Probed 2026-09-01: placing a PPID under `/Suburban_Composition` returned "Could not load asset at path". Check the row's `reach` field before you try anything. |
 
+            ## When a search returns nothing
+
+            Do not fall back to grepping `name`. Asset names are engineering names and a `name`
+            scan is how you end up scrolling a set you found by luck. Widen in this order, and stop
+            at the first step that returns something:
+
+            1. **Drop to one token.** Intersecting two plausible words is the single most common way
+               to get zero - `glass dome`, `greenhouse glass` and `farm plot` all return nothing
+               while `dome`, `gazebo` and `plot` return plenty. Search one word, then narrow.
+            2. **Try `gkw`.** The gallery vocabulary knows words the asset's own name does not. This
+               is the step that turns "Fortnite has no greenhouse" into a list of greenhouse-adjacent
+               props.
+            3. **Try a broader physical noun.** The index names what a thing IS, not what it is for:
+               a glass dome is a `gazebo`, a plaza tile is a `floor`, a planting bed is a
+               `flowerbed`. Colour is not indexed at all - there is no `orange` or `terracotta`
+               token - so search the material or set name instead (`claytile`, `stone`, `marble`).
+            4. **Scan this atlas's scope table.** The `sample vocabulary` column is the highest-
+               frequency words under each mount; reading it sideways tells you which theme owns the
+               look you want, and `theme` gives you the search term.
+            5. **List a gallery, then a sibling folder.** Pick a promising row, grep its `gal` ids to
+               see what ships alongside it, and only then use `find_assets(folder_path=...)` on the
+               folder half of its `sm` to enumerate the rest of that set.
+
+            ## Fragments
+
+            A row with `"frag":true` is one unit of a larger assembly - a quarter shell, a half
+            arch, a corner piece, a wall segment. **Its `sz` is the fragment's own bounds, not the
+            size of the assembled shape**, and the index carries no pivot or origin data, so you
+            cannot compute the assembly offsets from it.
+
+            Place ONE unit, look at it with `CaptureViewport`, and work out the transform from what
+            you see before you repeat it. Radial assemblies especially do not fall out of `sz`
+            arithmetic: four quarter-domes co-located at four yaws pinwheel, and the same four
+            offset by `sz/2` explode. This flag is a name heuristic (`Quarter`, `Half`, `Corner`,
+            `Seg`, `Piece`), so it finds the obvious cases and will miss a fragment named something
+            else - absence of `frag` is not proof of wholeness.
+
+            ## Previews mislead, in both directions
+
+            `CaptureAssetImage` is reliable for **silhouette and geometry** and unreliable for
+            **colour and material**. This is not only the grey-render case that `scopes.tsv` notes;
+            measured examples run both ways:
+
+            * A greenhouse wall previewed as blue tinted glass and is an opaque grey-tan wall in
+              the level. Chosen on the preview, it was the weakest element in the scene.
+            * A clay tile floor previewed as pale planks and renders strong orange-red in the level.
+              It was nearly rejected on the preview and was the best match in the index.
+            * An archway previewed flat grey and is white marble with a gold emblem.
+            * A hedge previewed plain green and carries pink flowers.
+
+            So: use the preview to choose a **shape**, then **place one candidate and
+            `CaptureViewport` it** before duplicating it across a scene. The in-level render is the
+            only thing that tells you what an asset actually looks like.
+
             ## Sizes
 
             `sz` is `[x, y, z]` in whole centimetres, read from the static mesh's render bounds - the
             true visual size of the thing you are about to place. A row with no `sz` is one whose
             blueprint exposed no static mesh (particle-only props, splines, volumes); it is still
             placeable, its size is just not knowable from the archive.
+
+            **`sz` is render bounds, not a tiling pitch.** For upright pieces - walls, hedges, fences
+            - they coincide, and a run spaced at `sz.x` lands flush (a 25-piece hedge perimeter
+            spaced at 428 read back at exactly 428). For floor and ground pieces they often do not:
+            the mesh's footprint and its pivot disagree, and a grid laid on `sz` comes out
+            staggered. Place two, measure the gap, then commit to the grid.
 
             **A row can have `sz` but no `sm`.** When every mesh a blueprint exposes is a shadow
             proxy, `sm` is deliberately null: a proxy measures correctly but `CaptureAssetImage`
@@ -277,15 +387,31 @@ public static class IndexWriters
 
             The `verified` column is a **status, not a boolean**, recording what the live editor
             actually did when somebody drove it against that mount ({verifiedCount} verified,
-            {missingCount} missing, {unverifiedCount} unverified here):
+            {missingCount} missing, {unverifiedCount} unverified here).
 
-            | value | meaning |
-            | --- | --- |
-            | `find+capture` | `find_assets` returned rows there **and** `CaptureAssetImage` rendered a textured preview. Fully usable. |
-            | `find` | `find_assets` returned rows. Capture was either not attempted or came back untextured - search works, preview quality is unconfirmed. |
-            | `find+capture+place`, `resolve+place` | As above plus a confirmed placement. |
-            | `missing` | **`find_assets` returned nothing.** The mount is not exposed in the UEFN content browser at all - see below. |
-            | `unverified` | Nobody has asked the editor. **Untested, not broken** - this dump can prove a path exists in the archive, never that UEFN will accept it. |
+            This table is generated from the file, so it lists every value `scopes.tsv` actually
+            contains and cannot drift out of date:
+
+            | value | scopes | what it means |
+            | --- | ---: | --- |
+
+            """);
+
+        foreach (var (label, count) in scopes
+                     .GroupBy(scope => scope.VerifiedLabel, StringComparer.Ordinal)
+                     .Select(group => (Label: group.Key, Count: group.Count()))
+                     .OrderByDescending(entry => entry.Count)
+                     .ThenBy(entry => entry.Label, StringComparer.Ordinal))
+        {
+            builder.AppendLine($"| `{label}` | {count} | {ExplainStatus(label)} |");
+        }
+
+        builder.Append($"""
+
+            **What a status licenses.** Only `missing` is a stop sign. Everything else - including
+            `unverified` - is safe to place from: a rehearsal placed 67 props across seven mounts,
+            most of them `unverified`, with zero failures. Treat the verbs as telling you what has
+            been *confirmed*, not what is *permitted*.
 
             `scopes.tsv` carries a `note` column with the operator's verbatim reason for each
             non-default status; the table below omits it for width.

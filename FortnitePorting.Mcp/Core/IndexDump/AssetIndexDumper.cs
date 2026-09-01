@@ -513,11 +513,24 @@ public sealed class AssetIndexDumper(
                     if (resolution.Failure is { } failure)
                         failures.Add($"{assetName}\tprop\t{failure}");
 
+                    // Two vocabularies, deliberately separated. kw is what this asset IS - its own
+                    // name, its theme, its creative tags - and is precise enough to rank on. gkw is
+                    // everything the galleries it appears in are called, which is pure recall: a
+                    // gallery named "...Prefab_Greenhouse" stamps "greenhouse" onto all 111 of its
+                    // members, boomboxes and tacos included. Merged into one field, as they were,
+                    // the recall tokens drown the precise ones and there is no way to rank.
                     var keywords = nameTokens
-                        .Concat(galleries.TokensByProp.TryGetValue(propKey, out var galleryTokens) ? galleryTokens : [])
                         .Concat(scope is null || scope.Theme.Length == 0 ? [] : Tokenize(scope.Theme))
                         .Concat(tags.SelectMany(Tokenize))
                         .ToList();
+
+                    var kw = Distinct(keywords);
+                    var ownTokens = kw.ToHashSet(StringComparer.Ordinal);
+
+                    // Anything the row already earns on its own name is not worth repeating here.
+                    var galleryKeywords = Distinct(
+                        (galleries.TokensByProp.TryGetValue(propKey, out var galleryTokens) ? galleryTokens : [])
+                        .Where(token => !ownTokens.Contains(token)));
 
                     // A row can reach into three different mounts: the PPID's, the blueprint's and
                     // the mesh's. All three are search targets, so all three earn a scope row.
@@ -542,8 +555,10 @@ public sealed class AssetIndexDumper(
                         Sz = resolution.Size,
                         Sc = scope?.ScopeId,
                         Cat = CategoryOf(tags),
+                        Frag = LooksLikeFragment(nameTokens) ? true : null,
                         Gal = galleryIds,
-                        Kw = Distinct(keywords)
+                        Kw = kw,
+                        Gkw = galleryKeywords.Count > 0 ? galleryKeywords : null
                     }, isCore, referenced, assetName));
                 }
                 catch (Exception e)
@@ -735,39 +750,65 @@ public sealed class AssetIndexDumper(
         return $"{path}.{path[(slash + 1)..]}";
     }
 
+    /// <summary>
+    /// Search tokens for one string: every CamelCase part, PLUS the joined form of each
+    /// underscore-delimited segment that had more than one part.
+    /// <para>
+    /// Both halves are load-bearing and each was learned from a failed search. Splitting alone
+    /// loses the compound a human actually types - "GreenHouse" becomes green + house, so
+    /// <c>greenhouse</c> matches nothing, and "PrincessCastle" becomes princess + castle, so
+    /// <c>princesscastle</c> matches nothing. Joining alone loses the words - a customer asking for
+    /// "a princess castle hedge" searches the parts. Emitting both costs about one extra token per
+    /// compound segment and makes every phrasing hit.
+    /// </para>
+    /// </summary>
     private static IEnumerable<string> Tokenize(string value)
     {
         if (string.IsNullOrWhiteSpace(value)) yield break;
 
         var buffer = new StringBuilder();
+        var segment = new List<string>();
+        var emitted = new List<string>();
 
-        void FlushInto(List<string> sink)
+        void FlushPart()
         {
             if (buffer.Length == 0) return;
-            sink.Add(buffer.ToString());
+            segment.Add(buffer.ToString());
             buffer.Clear();
         }
 
-        var parts = new List<string>();
+        void FlushSegment()
+        {
+            FlushPart();
+            if (segment.Count == 0) return;
+
+            emitted.AddRange(segment);
+
+            // The compound only says something new when it had parts to join.
+            if (segment.Count > 1) emitted.Add(string.Concat(segment));
+
+            segment.Clear();
+        }
+
         for (var i = 0; i < value.Length; i++)
         {
             var c = value[i];
             if (!char.IsLetterOrDigit(c))
             {
-                FlushInto(parts);
+                FlushSegment();
                 continue;
             }
 
             // Split CamelCase so "JuniperHedgeStraight" yields three usable tokens.
             if (char.IsUpper(c) && buffer.Length > 0 && !char.IsUpper(value[i - 1]))
-                FlushInto(parts);
+                FlushPart();
 
             buffer.Append(char.ToLowerInvariant(c));
         }
 
-        FlushInto(parts);
+        FlushSegment();
 
-        foreach (var part in parts)
+        foreach (var part in emitted)
         {
             if (part.Length < 2) continue;
             if (StopTokens.Contains(part)) continue;
@@ -775,6 +816,20 @@ public sealed class AssetIndexDumper(
             yield return part;
         }
     }
+
+    /// <summary>
+    /// Name markers for a piece that is one unit of a larger assembly rather than a whole object.
+    /// <para>
+    /// Matched as a token PREFIX, so "Corner01" and "Segment" both count. Measured on 42.00 before
+    /// shipping: 1,275 rows, 4.8% of the index, and a sample of the Corner hits was entirely
+    /// modular kit geometry (wall corners, trim corners, stair corners) rather than false
+    /// positives - which is why the flag ships rather than being dropped as noise.
+    /// </para>
+    /// </summary>
+    private static readonly string[] FragmentMarkers = ["quarter", "half", "corner", "seg", "piece"];
+
+    private static bool LooksLikeFragment(IEnumerable<string> nameTokens)
+        => nameTokens.Any(token => FragmentMarkers.Any(marker => token.StartsWith(marker, StringComparison.Ordinal)));
 
     /// <summary>
     /// PPID asset names end in an 8-character uniquifying hash. Indexing it gives every row a token

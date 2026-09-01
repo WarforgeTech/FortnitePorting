@@ -466,9 +466,13 @@ generated `atlas.md` so the consumer never has to rediscover them by failing:
  "gal":["PID_FNEC_Burd_Gallery_c","PID_FNEC_Burd_Prefab_b","PID_FNEC_Desert_M_Prefab_Hotel",
         "PID_FNEC_Desert_M_Prefab_Park","PID_FNEC_Desert_PropGallery_e",
         "PID_FNEC_Harbor_PropGallery_a","PID_FNEC_Utopia_Gallery_c"],
- "kw":["burd","city","deca","desert","gas","harbor","heatwave","hedge","helios","hotel","juniper",
-       "outdoor","park","prefab","sandy","square","station","store","straight","strip","town","utopia"]}
+ "kw":["helios","hedge","juniper","juniperhedge","straight","burd", …],
+ "gkw":["city","deca","desert","gas","harbor","heatwave","hotel","park","prefab","sandy", …]}
 ```
+
+Three fields are written **only when they say something**, so the common row pays nothing for them:
+`gkw` (gallery-derived recall tokens, omitted when it would duplicate `kw`), `frag` (`true` on a
+modular fragment, never written `false`) and `reach` (only when an identity is blocked).
 
 Keys are terse on purpose — the file is designed to be grepped whole, so every byte of key name is
 paid for 26,620 times. `sz` is the static mesh's render bounds in whole centimetres. `sc` joins to
@@ -607,6 +611,8 @@ per row saying why.
 | `dump-report.log` | 206,805 | 20,385 |
 | **total** | **19,349,934** | **1,936,489** (whole dir, deflate) |
 
+> Superseded — see *Findability* below for the current sizes after the `kw`/`gkw` split.
+
 Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,349,934 raw, 3,743,517 → 1,936,489
 zipped. The mount sweep and the reachability pass added ~8 KB to `scopes.tsv` (the `note` column),
 ~3 KB to `atlas.md`, and ~34 KB to `props-full.jsonl` — the `reach` field is emitted on only the
@@ -730,6 +736,137 @@ verified/missing split is unaffected. The itemised results were used, since they
 evidence the table is built from. Worth resolving before the next sweep — one of the two is wrong
 about how many captures actually ran.
 
+## Findability: the CE-4 rehearsal fixes
+
+A customer rehearsal built a 36×26 m environment from a mockup using only the shipped skill, the
+shipped index and the stock UEFN MCP. **Placement was flawless — 67/67 first try, zero failures,
+across seven mounts, six of them `unverified`** — which confirmed both the `ppid` route and the
+claim that `unverified` means untested rather than broken. What failed was **findability**: the
+first three queries for the two hero elements returned zero, and the fourth returned 111 unranked
+rows with a boombox above the asset actually wanted. Four fixes.
+
+### 1. Compound names are indexed both split and joined
+
+`Tokenize` already split CamelCase, so `PrincessCastle` yielded `princess` + `castle`. The
+rehearsal's failure was the other half: it searched the **joined** form and got nothing.
+
+The deeper version of the same bug was invisible until the `kw`/`gkw` split below was prototyped:
+`BP_LabRat_GreenHouse_Wall_A_A` splits to `green` + `house`, so the token `greenhouse` **was never
+on that row at all** — every one of the 111 `greenhouse` hits came from the gallery name. Splitting
+without joining would have made the hero case *worse*, not better.
+
+So each underscore-delimited segment now emits its parts **and**, when it had more than one, their
+concatenation.
+
+| row | `kw` |
+| --- | --- |
+| `CP_PrincessCastle_Hedge_Straight` | `castle, cp, cr, hedge, legacy, playsets, princess, princesscastle, straight` |
+
+`princess` (152 rows), `castle` (541) and `princesscastle` (133) all hit; all 6 `CP_PrincessCastle_Hedge_*`
+rows carry every form. `labrat`, `sevenb`, `artdeco` etc. come free from the same change.
+
+### 2. `kw` (precision) split from `gkw` (recall)
+
+`kw` now holds **only** the asset's own display name, asset name, theme and creative tags. `gkw`
+holds the gallery-derived tokens, minus anything already in `kw`, and is omitted entirely when it
+would add nothing.
+
+The measured effect on the rehearsal's worst case:
+
+| query | before | after |
+| --- | ---: | --- |
+| `greenhouse` in `kw` | 111 unranked, boombox/tacos/HVAC above the target | **3 rows** — `BP_LabRat_GreenHouse_Wall_A_A`, `..._Wall_A_B`, `BP_LightSource_HangingLightShort_B_A_Greenhouse` |
+| `greenhouse` in `gkw` | — | 108 rows, the recall pool |
+| `BP_Audio_BoomBox_A` | `greenhouse` in `kw` | `greenhouse` in `gkw` only |
+
+The two LabRat greenhouse walls — the asset the rehearsal reached at "roughly row 43 of an
+unordered list" — are now 2 of 3 hits.
+
+Token cost: `kw` averages **6.62** tokens/row (176,241 total), `gkw` **8.02** (213,532 total, present
+on 25,635 of 26,620 rows).
+
+### 3. `frag` — a name heuristic, shipped, and honest about what it misses
+
+`"frag":true` marks a row whose name carries `Quarter`, `Half`, `Corner`, `Seg` or `Piece` as a
+token prefix. Measured **before** deciding to ship, per the brief: **1,268 rows, 4.8%** of the index.
+A sample of the `Corner` hits — `AD_JS_Wall_01_Corner`, `AD_Trim_Exterior_Corner`,
+`Agency_Stairs_Corner` — is entirely modular kit geometry, so the flag is signal rather than noise
+and it ships.
+
+**It does not catch the asset that motivated it.** `BP_SunGold_Gazebo_Dome_A_A` is a quarter shell
+and its name says `Dome`, nothing more; it gets no `frag`. The heuristic finds fragments that admit
+to being fragments, and the atlas says so in as many words ("absence of `frag` is not proof of
+wholeness").
+
+The real fix is available and cheap, and is **not** done here: `PropMeshResolver` already reads
+`MeshBoundsInfo.Origin` during the bounds pass and discards it. A whole mesh sits near origin-zero
+in X/Y; a quarter shell's origin is offset by roughly half its extent. Emitting that offset would
+both catch shells the name hides **and** give the pivot data the rehearsal needed to assemble the
+dome (it burned three placement iterations and a delete cycle without it). That is the next
+schema change worth making.
+
+### 4. Atlas: generated status legend, a zero-result ladder, and a preview warning
+
+**The scope-status legend is now generated from the data.** The consumer's documentation claimed
+three statuses while `scopes.tsv` shipped six, leaving an agent to guess what `resolve+place` meant
+or whether `find` was safe to place from. A hand-written list drifts; a generated one cannot. All
+six values, with counts, exactly matching what the rehearsal found in the file:
+
+| value | scopes |
+| --- | ---: |
+| `unverified` | 231 |
+| `find+capture` | 19 |
+| `find` | 14 |
+| `missing` | 7 |
+| `find+capture+place` | 1 |
+| `resolve+place` | 1 |
+
+Each row gets a gloss composed from its verbs, followed by the thing the rehearsal actually
+established: **only `missing` is a stop sign; everything else including `unverified` is safe to
+place from** — 67 placements across mostly-`unverified` mounts, zero failures. The verbs say what
+has been *confirmed*, not what is *permitted*.
+
+**A "when a search returns nothing" ladder**, because the previous guidance ("intersect two `kw`
+tokens") makes zero-results *more* likely — `glass dome`, `greenhouse glass` and `farm plot` all
+returned nothing. Five steps, explicitly not name-grep: drop to one token → try `gkw` → try a
+broader physical noun (and a note that **colour is not indexed at all**, so search the material or
+set name) → scan the atlas scope table's vocabulary column → list a gallery, then `find_assets` a
+sibling folder.
+
+**A preview warning.** The previous text warned only that `CaptureAssetImage` is unreliable after a
+material change. The rehearsal found it unreliable as a material preview *period*, misleading in
+both directions: a greenhouse wall previewed as blue tinted glass and is an opaque grey-tan wall
+(chosen on that preview, it was the scene's weakest element); a clay tile floor previewed as pale
+planks and renders strong orange-red (nearly rejected, it was the best match in the index). The
+atlas now says the preview is reliable for **silhouette and geometry**, unreliable for **colour and
+material**, and tells the agent to place one candidate and `CaptureViewport` it before duplicating.
+
+**A `sz` qualifier** (adjacent, one paragraph): `sz` is render bounds, not a tiling pitch. It
+coincides for upright pieces — a 25-piece hedge run spaced at 428 read back at exactly 428 — and
+often does not for floor pieces, where pivot and footprint disagree and a grid comes out staggered.
+
+### Verification
+
+* **Determinism holds.** Two consecutive dumps: `atlas.md`, `scopes.tsv`, `galleries.jsonl`,
+  `props-full.jsonl`, `dump-report.log` byte-identical; `META.json` differs only in `generatedUtc`.
+* Row counts, reachability and scope statuses are unchanged by these fixes (26,620 rows; 24,422
+  fully reachable / 850 partial / 1,348 unreachable; 35 verified / 7 missing / 231 unverified).
+
+### Sizes
+
+| file | raw bytes | gzip -9 |
+| --- | ---: | ---: |
+| `META.json` | 598 | 342 |
+| `atlas.md` | 44,746 | 14,470 |
+| `scopes.tsv` | 36,219 | 9,768 |
+| `galleries.jsonl` | 566,935 | 71,323 |
+| `props-full.jsonl` | 19,380,590 | 1,900,874 |
+| `dump-report.log` | 206,805 | 20,385 |
+| **total** | **20,235,893** | **2,017,230** (whole dir, deflate) |
+
+`props-full.jsonl` grew 897 KB (+4.9%) for the joined compounds and the `kw`/`gkw` split; `atlas.md`
+grew 6 KB for the three new sections. Both are cheap for what they buy.
+
 ## Dropped: `props-core.jsonl`
 
 The original design shipped a second, denser row file — gallery members ∪ curated name families.
@@ -761,6 +898,13 @@ say the same thing twice.
   are not applied, so a prop whose SCS scales its mesh reports the unscaled size.
 * **Only `Prop` is indexed.** Prefabs appear as galleries (name + membership + scope) but have no
   rows of their own, and no other category is covered.
+* **`frag` misses fragments whose names do not admit it.** It is a name heuristic and catches 1,268
+  rows; the quarter-dome that motivated it (`BP_SunGold_Gazebo_Dome_A_A`) is not among them. The
+  mesh `Origin` needed to detect off-centre shells — and to give the pivot data a multi-piece
+  assembly actually needs — is already read during the bounds pass and thrown away.
+* **Colour is not searchable.** There is no `orange` or `terracotta` token; a mockup described by
+  colour has to be translated into a material or set name by hand. The atlas says so and points at
+  the workaround, but deriving dominant-colour tokens at dump time would be the real fix.
 * **231 of the 273 scopes are still `unverified`.** The sweep covered the top 40 by row count, which
   is most of the volume but a small share of the mounts. Everything below `/Dvoyager_Comp` (244
   rows) is untested.
