@@ -47,7 +47,7 @@ public sealed record IconResult(byte[] Png, IconSource Source, string? TexturePa
 /// any UTexture2D export in the same package -> the category placeholder texture -> a generated cell.
 /// Per-prop icon resolution in Fortnite is genuinely unreliable, so every step is best-effort.
 /// </summary>
-public sealed class IconResolver(HeadlessLoader loader, McpConfig config)
+public sealed class IconResolver(HeadlessLoader loader, McpConfig config, AssetQuery assets)
 {
     /// <summary>Names swept when the category handlers come up empty.</summary>
     private static readonly string[] WideIconNames =
@@ -72,19 +72,45 @@ public sealed class IconResolver(HeadlessLoader loader, McpConfig config)
         }
     }
 
-    public async Task<IconResult> ResolveAsync(string objectPath, int size, CancellationToken cancellationToken = default)
+    /// <param name="iconOverridePath">
+    /// A texture path the caller already knows is the right icon for this object - what the catalog
+    /// pins to a hand-authored asset (Wildlife, WeaponMod), whose mesh carries no icon property of
+    /// its own and would otherwise resolve to a placeholder. Callers that already hold the
+    /// <see cref="CategoryItem"/> pass it directly; <c>get_asset_icon</c>, which only gets a path,
+    /// lets the resolver look it up.
+    /// </param>
+    public async Task<IconResult> ResolveAsync(
+        string objectPath, int size, CancellationToken cancellationToken = default, string? iconOverridePath = null)
     {
         size = Math.Clamp(size, 16, 1024);
 
         if (TryReadCache(objectPath, size) is { } cached) return cached;
 
-        var result = await ResolveUncachedAsync(objectPath, size, cancellationToken).ConfigureAwait(false);
+        var result = await ResolveUncachedAsync(objectPath, size, iconOverridePath, cancellationToken).ConfigureAwait(false);
         WriteCache(objectPath, size, result);
         return result;
     }
 
-    private async Task<IconResult> ResolveUncachedAsync(string objectPath, int size, CancellationToken cancellationToken)
+    private async Task<IconResult> ResolveUncachedAsync(
+        string objectPath, int size, string? iconOverridePath, CancellationToken cancellationToken)
     {
+        // 0 - a catalog-pinned icon always wins: the object it belongs to is a bare mesh, so every
+        // later step in the chain would fall through to the placeholder.
+        iconOverridePath ??= assets.ManualFor(objectPath)?.IconPath;
+        if (!string.IsNullOrWhiteSpace(iconOverridePath))
+        {
+            try
+            {
+                if (await loader.Provider.SafeLoadPackageObjectAsync<UTexture2D>(iconOverridePath).ConfigureAwait(false) is { } pinned &&
+                    await EncodeAsync(pinned, size, cancellationToken).ConfigureAwait(false) is { } pinnedPng)
+                    return new IconResult(pinnedPng, IconSource.Handler, SafePath(pinned));
+            }
+            catch (Exception e)
+            {
+                Log.Debug("Icon: catalog icon {Path} failed: {Message}", iconOverridePath, e.Message);
+            }
+        }
+
         UObject? asset = null;
         try
         {

@@ -15,17 +15,38 @@ public abstract record NameIndexState
     public sealed record Ready(int Count, int Rows, bool FromCache) : NameIndexState;
     public sealed record Failed(string Message) : NameIndexState;
 
+    /// <summary>
+    /// Not in memory yet, but a disk cache exists and will be loaded the moment anything asks for
+    /// this category. Reported by get_status so a fresh process does not claim "no display-name
+    /// search available" when a search in that same process would answer instantly.
+    /// </summary>
+    public sealed record Cached(int Count) : NameIndexState;
+
+    /// <summary>
+    /// The category has no registry-backed classes at all (Wildlife, WeaponMod): its assets are
+    /// hand-authored in the catalog and carry their names with them, so there is nothing to index
+    /// and search_assets always matches them by name. Never "not built".
+    /// </summary>
+    public sealed record Catalog : NameIndexState;
+
     public string Name => this switch
     {
         Ready => "ready",
+        Cached => "cached",
+        Catalog => "catalog",
         Building => "building",
         Failed => "failed",
         _ => "notBuilt"
     };
 
+    /// <summary>True when a lookup will succeed now or within a disk read.</summary>
+    public bool IsUsable => this is Ready or Cached or Catalog;
+
     public float Percent => this switch
     {
         Ready => 100f,
+        Cached => 100f,
+        Catalog => 100f,
         Building building => building.Total == 0 ? 100f : building.Done * 100f / building.Total,
         _ => 0f
     };
@@ -52,6 +73,13 @@ public sealed class DisplayNameIndex(HeadlessLoader loader, AssetQuery assets, M
 
     private const int MaxDegreeOfParallelism = 12;
     private const int ProgressEvery = 5_000;
+
+    /// <summary>
+    /// Bumped whenever a DisplayNameHandler changes what it produces, so on-disk caches written by
+    /// an older build are discarded even though the game version and row count are unchanged.
+    /// v2: Banner now indexes its asset name (all ~1000 rows shared the string "Banner Icon").
+    /// </summary>
+    private const int SchemaVersion = 2;
 
     private static readonly IReadOnlyDictionary<string, string> EmptyMap =
         new Dictionary<string, string>(0, StringComparer.OrdinalIgnoreCase);
@@ -137,6 +165,12 @@ public sealed class DisplayNameIndex(HeadlessLoader loader, AssetQuery assets, M
 
     public record CategorySnapshot(string Category, NameIndexState State, int Count, int Rows);
 
+    /// <summary>
+    /// Per-category state for get_status. A category that is not in memory yet is probed on disk
+    /// (a ~200-byte header read, never the whole file) and reported as "cached" with its row count,
+    /// because a search in this same process would load it and answer. Reporting those as "notBuilt"
+    /// told clients display-name search was unavailable when it demonstrably was not.
+    /// </summary>
     public IReadOnlyList<CategorySnapshot> Snapshot()
     {
         var list = new List<CategorySnapshot>();
@@ -144,9 +178,16 @@ public sealed class DisplayNameIndex(HeadlessLoader loader, AssetQuery assets, M
         {
             var state = Get(entry.Type);
             var current = state?.State ?? new NameIndexState.NotBuilt();
+
+            if (current is NameIndexState.NotBuilt or NameIndexState.Ready { Rows: 0 } && entry.ClassNames.Length == 0)
+                current = new NameIndexState.Catalog();
+            else if (current is NameIndexState.NotBuilt && PeekCacheCount(entry.Type) is { } cachedCount)
+                current = new NameIndexState.Cached(cachedCount);
+
             var (count, rows) = current switch
             {
                 NameIndexState.Ready ready => (ready.Count, ready.Rows),
+                NameIndexState.Cached cached => (cached.Count, 0),
                 NameIndexState.Building building => (state?.Map.Count ?? 0, building.Total),
                 _ => (0, 0)
             };
@@ -161,13 +202,71 @@ public sealed class DisplayNameIndex(HeadlessLoader loader, AssetQuery assets, M
     public int TotalCategoryCount => CategoryCatalog.Entries.Count;
     public int TotalNames => CategoryCatalog.Entries.Sum(entry => CountFor(entry.Type));
 
-    /// <summary>Overall coverage word used in tool notes.</summary>
-    public string Coverage => ReadyCategoryCount switch
+    /// <summary>Categories that are not in memory but have a usable disk cache behind them.</summary>
+    public int CachedCategoryCount => Snapshot().Count(snapshot => snapshot.State is NameIndexState.Cached);
+
+    /// <summary>Categories a lookup can be answered for now or after a disk read.</summary>
+    public int AvailableCategoryCount => Snapshot().Count(snapshot => snapshot.State.IsUsable);
+
+    /// <summary>Display names held in memory plus those sitting in a disk cache.</summary>
+    public int AvailableNames => Snapshot().Where(snapshot => snapshot.State.IsUsable).Sum(snapshot => snapshot.Count);
+
+    /// <summary>Overall coverage word used in tool notes. Counts disk-cached categories as covered.</summary>
+    public string Coverage => AvailableCategoryCount switch
     {
         0 => "none",
-        var ready when ready >= TotalCategoryCount => "complete",
+        var available when available >= TotalCategoryCount => "complete",
         _ => "partial"
     };
+
+    /// <summary>
+    /// Reads only the <c>Count</c> header out of a category's cache file, without deserialising the
+    /// (up to 100k entry) name map. Returns null when there is no cache. The stamp is deliberately
+    /// NOT validated here - that needs a full registry pass per category and get_status must not
+    /// block; a stale cache is caught and rebuilt by <see cref="TryLoadCache"/> on first real use.
+    /// </summary>
+    private readonly ConcurrentDictionary<EExportType, int> _cachePeeks = new();
+
+    private int? PeekCacheCount(EExportType type)
+    {
+        // Memoised: once a category is peeked, the only thing that changes its cache file is this
+        // process writing it - at which point the category is Ready and never peeked again.
+        if (_cachePeeks.TryGetValue(type, out var memoised)) return memoised < 0 ? null : memoised;
+
+        var count = ReadCacheCount(type);
+        _cachePeeks[type] = count ?? -1;
+        return count;
+    }
+
+    private int? ReadCacheCount(EExportType type)
+    {
+        var path = CachePath(type);
+
+        try
+        {
+            if (!File.Exists(path)) return null;
+
+            using var stream = File.OpenRead(path);
+            var buffer = new byte[512];
+            var read = stream.Read(buffer, 0, buffer.Length);
+            if (read <= 0) return null;
+
+            var reader = new Utf8JsonReader(buffer.AsSpan(0, read), isFinalBlock: false, state: default);
+            while (reader.Read())
+            {
+                if (reader.TokenType is not JsonTokenType.PropertyName) continue;
+                if (!reader.ValueTextEquals("Count")) continue;
+                if (reader.Read() && reader.TokenType is JsonTokenType.Number) return reader.GetInt32();
+                return null;
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug("[NAMEINDEX] {Category}: cache peek failed: {Message}", type, e.Message);
+        }
+
+        return null;
+    }
 
     // ---------------------------------------------------------------- build control
 
@@ -420,7 +519,7 @@ public sealed class DisplayNameIndex(HeadlessLoader loader, AssetQuery assets, M
         try { version = loader.Provider.Versions.Game.ToString(); }
         catch { /* provider not up; the row count alone still guards the cache */ }
 
-        return $"{version}|{rowCount}";
+        return $"{version}|{rowCount}|v{SchemaVersion}";
     }
 
     private string CachePath(EExportType type) => Path.Combine(CacheFolder.FullName, $"{type}.json");

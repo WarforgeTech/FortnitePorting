@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using CUE4Parse.GameTypes.FN.Assets.Exports.DataAssets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Exports.Animation;
@@ -15,6 +14,7 @@ using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.Engine.Animation;
 using CUE4Parse.UE4.Objects.GameplayTags;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.Utils;
 using FortnitePorting.CUE4Parse.Extensions;
 using FortnitePorting.CUE4Parse.Models.Unreal.VirtualTexture;
 using FortnitePorting.Exporting;
@@ -44,17 +44,6 @@ public record ManuallyDefinedAsset
 }
 
 /// <summary>
-/// Per-enumeration mutable state that the HidePredicate / AddStyleHandler callbacks operate on.
-/// In the GUI these lived on the AssetLoader instance; headless they are handed in explicitly
-/// so the catalog itself stays immutable and reusable across concurrent MCP requests.
-/// </summary>
-public class AssetEnumerationState
-{
-    public readonly ConcurrentBag<string> FilteredAssetBag = [];
-    public readonly ConcurrentDictionary<string, ConcurrentBag<string>> StyleDictionary = [];
-}
-
-/// <summary>
 /// One entry of the asset category table, lifted verbatim from AssetLoaderService.Categories.
 /// UI-only concerns (filters, observable collections, custom/Oshawott assets) are dropped.
 /// </summary>
@@ -79,13 +68,28 @@ public record AssetCategoryEntry
     public Func<UObject, string?> DescriptionHandler { get; init; } = asset => asset.GetAnyOrDefault<FText?>("Description", "ItemDescription")?.Text.TrimEnd();
     public Func<UObject, FGameplayTagContainer?> GameplayTagHandler { get; init; } = CategoryCatalog.GetGameplayTags;
 
-    public Func<AssetEnumerationState, UObject, string, bool> HidePredicate { get; init; } = (state, asset, name) => false;
-    public Action<AssetEnumerationState, UObject, string> AddStyleHandler { get; init; } = (state, asset, name) => { };
-
     public ManuallyDefinedAsset[] ManuallyDefinedAssets { get; init; } = [];
     public Func<HeadlessLoader, ManuallyDefinedAsset[]>? ManuallyDefinedAssetsFactory { get; init; }
 
+    /// <summary>
+    /// Collapse rows that share a display name onto their first occurrence (rarity/tier clones -
+    /// WID_ArcadeShotgun_C / _R / _SR are one "8-Bit Shotgun"). This is the declarative form of the
+    /// old <see cref="HidePredicate"/> dedupe: <see cref="AssetQuery.Canonical"/> can apply it to the
+    /// WHOLE category up front, so browse_category and make_contact_sheet page the same list.
+    /// </summary>
+    public bool DedupeDisplayNames { get; init; }
+
+    /// <summary>
+    /// Append a short asset-name discriminator to display names that several rows share, for
+    /// categories where the duplicates are genuinely different assets (Vehicle: 7 "Whiplash"es).
+    /// </summary>
+    public bool DisambiguateDuplicateNames { get; init; }
+
     public UTexture2D? GetIcon(UObject asset) => LowResIconHandler(asset) ?? HighResIconHandler(asset);
+
+    /// <summary>True when this row's package path matches one of the category's HideNames.</summary>
+    public bool IsHiddenName(string packagePath)
+        => HideNames.Any(name => packagePath.Contains(name, StringComparison.OrdinalIgnoreCase));
 }
 
 /// <summary>
@@ -94,22 +98,6 @@ public record AssetCategoryEntry
 /// </summary>
 public static class CategoryCatalog
 {
-    // Shared with the Prop / Item / Trap loaders: first occurrence of a display name wins,
-    // subsequent ones are folded away as styles of the first.
-    private static readonly Func<AssetEnumerationState, UObject, string, bool> DedupeByDisplayName = (state, asset, name) =>
-    {
-        if (state.FilteredAssetBag.Contains(name)) return true;
-        state.FilteredAssetBag.Add(name);
-        return false;
-    };
-
-    private static readonly Action<AssetEnumerationState, UObject, string> CollectStyleByDisplayName = (state, asset, name) =>
-    {
-        var path = asset.GetPathName();
-        state.StyleDictionary.TryAdd(name, []);
-        state.StyleDictionary[name].Add(path);
-    };
-
     public static readonly IReadOnlyList<AssetCategoryEntry> Entries =
     [
         // ---------------- Cosmetics ----------------
@@ -206,7 +194,12 @@ public static class CategoryCatalog
             Type = EExportType.Banner,
             Category = EAssetCategory.Cosmetics,
             ClassNames = ["FortHomebaseBannerIconItemDefinition"],
-            HideRarity = true
+            HideRarity = true,
+            // Every one of the ~1000 FortHomebaseBannerIconItemDefinitions carries the SAME
+            // localised DisplayName, the literal string "Banner Icon", so the real name is only in
+            // the asset name (Banner_Akita). Using it here fixes browse labels, contact-sheet
+            // legends AND the display-name index in one place.
+            DisplayNameHandler = asset => PrettifyAssetName(asset.Name)
         },
         new()
         {
@@ -220,7 +213,11 @@ public static class CategoryCatalog
             Category = EAssetCategory.Cosmetics,
             ClassNames = ["AthenaDanceItemDefinition"],
             HideNames = ["_CT", "_NPC", "_Sync", "_Follower", "_Owned", "Sprout"],
-            LoadHiddenAssets = true
+            LoadHiddenAssets = true,
+            // LoadHiddenAssets skips HideNames entirely, so the "_CT" above never fired and page 0
+            // of the category was 16/24 identical white CapturePose silhouettes. DisallowedNames is
+            // applied unconditionally, which is what these internal capture rigs need.
+            DisallowedNames = ["EID_CT_CapturePose", "_Creative_Test"]
         },
         new()
         {
@@ -244,8 +241,7 @@ public static class CategoryCatalog
             Category = EAssetCategory.Creative,
             ClassNames = ["FortPlaysetPropItemDefinition"],
             HideRarity = true,
-            HidePredicate = DedupeByDisplayName,
-            AddStyleHandler = CollectStyleByDisplayName
+            DedupeDisplayNames = true
         },
         new()
         {
@@ -279,9 +275,17 @@ public static class CategoryCatalog
                 "FortWeaponMeleeItemDefinition", "FortCreativeWeaponMeleeItemDefinition",
                 "FortCreativeWeaponRangedItemDefinition", "FortWeaponMeleeDualWieldItemDefinition"
             ],
-            HideNames = ["_Harvest", "Weapon_Pickaxe_", "Weapons_Pickaxe_", "Dev_WID", "Juno"],
-            HidePredicate = DedupeByDisplayName,
-            AddStyleHandler = CollectStyleByDisplayName
+            // The three path families appended here ship no icon art at all: sampled 96 rows of
+            // /SaveTheWorld/Items/Weapons/ (3,784 rows - the STW rarity x material x tier clone
+            // matrix), 96 of /Sprout (234) and 48 of DIsguiseDevice_SW (61) and got realIconCount 0
+            // for every one. They were 37 of the 37 icon-coverage misses in a 60-row sample.
+            // They stay reachable through search_files and by direct objectPath export.
+            HideNames =
+            [
+                "_Harvest", "Weapon_Pickaxe_", "Weapons_Pickaxe_", "Dev_WID", "Juno",
+                "/SaveTheWorld/Items/Weapons/", "DIsguiseDevice_SW", "/Sprout"
+            ],
+            DedupeDisplayNames = true
         },
         new()
         {
@@ -294,15 +298,27 @@ public static class CategoryCatalog
             Type = EExportType.Resource,
             Category = EAssetCategory.Gameplay,
             ClassNames = ["FortIngredientItemDefinition", "FortResourceItemDefinition"],
-            HideNames = ["SurvivorItemData", "OutpostUpgrade_StormShieldAmplifier"]
+            // Juno/LEGO ingredients (220 rows across JunoGame/JunoTabasco*/JunoNeptune*/JunoKlombo*/
+            // JunoEventAnubis) and STW crafting ingredients (46 rows) are pure data with no icon:
+            // sampled 142 of the 266 and every single one resolved to the placeholder texture.
+            // The tail: STW RepairRadar mission parts (5 rows) and Sprout currency tokens (4 rows),
+            // all placeholder-only, which between them made up the whole of the last browse page.
+            HideNames =
+            [
+                "SurvivorItemData", "OutpostUpgrade_StormShieldAmplifier",
+                "Juno", "/SaveTheWorld/Items/Ingredients/", "/SaveTheWorld/Missions/", "/Sprout"
+            ]
         },
         new()
         {
             Type = EExportType.Trap,
             Category = EAssetCategory.Gameplay,
             ClassNames = ["FortTrapItemDefinition"],
-            HideNames = ["TID_Creative", "TID_Floor_Minigame_Trigger_Plate"],
-            HidePredicate = DedupeByDisplayName
+            // 347 of the 444 trap definitions are the STW rarity/tier ladder under
+            // /SaveTheWorld/Items/Traps/ (TID_Floor_Freeze_R_T02 ...). Sampled 96 of them across two
+            // pages: realIconCount 0. Contact sheet page 8 was 24/24 magenta before this.
+            HideNames = ["TID_Creative", "TID_Floor_Minigame_Trigger_Plate", "/SaveTheWorld/Items/Traps/"],
+            DedupeDisplayNames = true
         },
         new()
         {
@@ -312,7 +328,11 @@ public static class CategoryCatalog
             LowResIconHandler = asset => GetVehicleMetadata<UTexture2D>(asset, "Icon", "SmallPreviewImage"),
             HighResIconHandler = asset => GetVehicleMetadata<UTexture2D>(asset, "Icon", "LargePreviewImage"),
             DisplayNameHandler = asset => GetVehicleMetadata<FText>(asset, "DisplayName", "ItemName")?.Text,
-            HideRarity = true
+            DescriptionHandler = DescribeVehicle,
+            HideRarity = true,
+            // 7 vehicles are called "Whiplash", 4 "Baller": without a discriminator a sheet legend
+            // cannot tell you which cell is which.
+            DisambiguateDuplicateNames = true
         },
         new()
         {
@@ -341,20 +361,11 @@ public static class CategoryCatalog
             Type = EExportType.Sprite,
             Category = EAssetCategory.Gameplay,
             ClassNames = ["ExtractableItemDefinition"],
-            LoadHiddenAssets = true,
-            HidePredicate = (state, asset, name) => asset.GetOrDefault<FSoftObjectPath?>("ParentExtractableDefinition") is not null,
-            AddStyleHandler = (state, asset, name) =>
-            {
-                var parentDefPath = asset.GetOrDefault<FSoftObjectPath>("ParentExtractableDefinition");
-
-                var key = asset.Name;
-                if (parentDefPath.TryLoad(out var parentDef))
-                    key = parentDef.Name;
-
-                var path = asset.GetPathName();
-                state.StyleDictionary.TryAdd(key, []);
-                state.StyleDictionary[key].Add(path);
-            }
+            LoadHiddenAssets = true
+            // Sprite variants (ESD_AirSprite_Variant_Gold ...) are separate ExtractableItemDefinitions
+            // that point back at their parent through ParentExtractableDefinition. They are kept as
+            // browsable rows in their own right and additionally surfaced as a channel on the parent
+            // by list_asset_styles (see ExportTools.ReadSpriteVariants).
         },
 
         // ---------------- Festival ----------------
@@ -382,6 +393,60 @@ public static class CategoryCatalog
     public static AssetCategoryEntry? ForClassName(string className)
         => Entries.FirstOrDefault(entry => entry.ClassNames.Contains(className));
 
+    /// <summary>
+    /// Human-readable fallback for an asset that has no localised display name (dev/test rows such
+    /// as <c>SID_Guitar_Figure</c>, <c>CID_BentBaton_Temp</c>) and the real name for Banner, whose
+    /// entire class shares the single string "Banner Icon".
+    /// <para>
+    /// Strips the definition-type prefix, splits on underscores and CamelCase boundaries. It is a
+    /// LABEL, never an identity: the asset name is always reported alongside it, and the
+    /// display-name search index still stores only genuine localised names.
+    /// </para>
+    /// </summary>
+    public static string PrettifyAssetName(string assetName)
+    {
+        if (string.IsNullOrWhiteSpace(assetName)) return assetName;
+
+        // Definition-type prefixes used across the Fortnite item definitions.
+        string[] prefixes =
+        [
+            "Banner_", "CID_", "EID_", "BID_", "Backpack_", "Pickaxe_ID_", "Pickaxe_", "Glider_ID_",
+            "Glider_", "WID_", "TID_", "VID_", "SID_", "SPID_", "PID_", "AGID_", "ESD_", "ID_",
+            "Emoji_", "LSID_", "Petcarrier_", "Companion_", "Bean_", "Character_", "Trap_", "Vehicle_"
+        ];
+
+        var trimmed = assetName;
+        foreach (var prefix in prefixes)
+        {
+            if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            var candidate = trimmed[prefix.Length..];
+            // Never prettify away the whole name (e.g. an asset literally called "ID_").
+            if (candidate.Length >= 2) trimmed = candidate;
+            break;
+        }
+
+        var builder = new System.Text.StringBuilder(trimmed.Length + 8);
+        for (var i = 0; i < trimmed.Length; i++)
+        {
+            var c = trimmed[i];
+            if (c is '_' or '-')
+            {
+                if (builder.Length > 0 && builder[^1] != ' ') builder.Append(' ');
+                continue;
+            }
+
+            // CamelCase boundary: lower/digit followed by upper, or upper followed by upper+lower.
+            if (i > 0 && char.IsUpper(c) && builder.Length > 0 && builder[^1] != ' ' &&
+                (!char.IsUpper(trimmed[i - 1]) || (i + 1 < trimmed.Length && char.IsLower(trimmed[i + 1]))))
+                builder.Append(' ');
+
+            builder.Append(c);
+        }
+
+        var result = builder.ToString().Trim();
+        return result.Length == 0 ? assetName : result;
+    }
+
     // ---------------- Default handlers (AssetLoader.cs ~392-413) ----------------
 
     public static UTexture2D? GetLowResIcon(UObject asset)
@@ -402,6 +467,33 @@ public static class CategoryCatalog
     {
         return asset.GetDataListItem<FGameplayTagContainer?>("Tags")
                ?? asset.GetOrDefault<FGameplayTagContainer?>("GameplayTags");
+    }
+
+    /// <summary>
+    /// FortVehicleItemDefinition genuinely carries no Description text, on the definition or on the
+    /// actor blueprint's MarkerDisplay - all 109 vehicles reported "No Description." Rather than keep
+    /// printing that, surface the metadata the definition DOES hold and that a caller can act on: the
+    /// in-game spawn aliases (what a Creative "spawn vehicle" command accepts) and the vehicle actor
+    /// class. Both are plain properties on the already-loaded object, so this costs nothing.
+    /// </summary>
+    private static string? DescribeVehicle(UObject asset)
+    {
+        var localised = GetVehicleMetadata<FText>(asset, "Description", "ItemDescription")?.Text.TrimEnd();
+        if (!string.IsNullOrWhiteSpace(localised)) return localised;
+
+        var parts = new List<string>();
+
+        var spawnNames = asset.GetOrDefault<string[]>("SpawnVehicleNames", []);
+        if (spawnNames.Length > 0) parts.Add($"Spawn names: {string.Join(", ", spawnNames)}.");
+
+        try
+        {
+            if (asset.GetOrDefault<FSoftObjectPath?>("VehicleActorClass")?.AssetPathName.Text is { Length: > 0 } actorClass)
+                parts.Add($"Actor class: {actorClass.SubstringAfterLast('/')}.");
+        }
+        catch { /* optional */ }
+
+        return parts.Count == 0 ? null : string.Join(" ", parts);
     }
 
     /// <summary>Copied from the GUI's CUE4ParseExtensions: vehicles hide their metadata behind the actor blueprint.</summary>

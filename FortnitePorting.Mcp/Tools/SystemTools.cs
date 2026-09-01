@@ -43,7 +43,10 @@ public static class SystemTools
                 ["dataDirectory"] = config.DataDirectory,
                 ["exportDirectory"] = config.ExportFolder.FullName,
                 ["language"] = config.Language.ToString()
-            }
+            },
+            // False means the unmanaged ACL decoder did not load, and every animation export
+            // (all emotes, lobby poses) will come out without its .ueanim.
+            ["nativeAnimationSupport"] = ExportRunner.NativeAnimationSupport
         };
 
         if (state is LoadState.Failed failed)
@@ -92,7 +95,8 @@ public static class SystemTools
             var entry = new JsonObject
             {
                 ["status"] = snapshot.State.Name,
-                ["displayNames"] = snapshot.Count
+                ["displayNames"] = snapshot.Count,
+                ["usable"] = snapshot.State.IsUsable
             };
 
             if (snapshot.State is NameIndexState.Building)
@@ -111,10 +115,17 @@ public static class SystemTools
         {
             ["coverage"] = names.Coverage,
             ["readyCategories"] = names.ReadyCategoryCount,
+            // Not in memory yet, but a disk cache is sitting there: a search in THIS process loads
+            // it and answers. Reporting these as notBuilt made a warm server look cold.
+            ["cachedCategories"] = names.CachedCategoryCount,
+            ["usableCategories"] = names.AvailableCategoryCount,
             ["totalCategories"] = names.TotalCategoryCount,
             ["displayNames"] = names.TotalNames,
+            ["availableDisplayNames"] = names.AvailableNames,
             ["categories"] = categories,
-            ["note"] = "search_assets matches display names for every category listed as \"ready\"; the rest match asset/package names only until their build finishes."
+            ["note"] = "search_assets matches display names for every category whose usable flag is true - \"ready\" means already in "
+                       + "memory, \"cached\" means it loads from disk on first use (effectively instant). Only \"notBuilt\", \"building\" "
+                       + "and \"failed\" fall back to asset/package-name matching."
         };
     }
 

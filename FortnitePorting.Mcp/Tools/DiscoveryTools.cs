@@ -29,16 +29,24 @@ public static class DiscoveryTools
 
     [McpServerTool(Name = "list_categories", ReadOnly = true, Title = "List asset categories")]
     [Description("""
-                 Lists every asset category the server can browse, with how many asset-registry rows
-                 each one holds. The `exportType` values here are exactly what search_assets,
-                 browse_category and make_contact_sheet accept as their `category` argument.
+                 Lists every asset category the server can browse, with how many BROWSABLE assets each
+                 one holds - the same deduped count browse_category and make_contact_sheet page over,
+                 not the raw registry row count. The `exportType` values here are exactly what
+                 search_assets, browse_category and make_contact_sheet accept as their `category`
+                 argument.
                  """)]
     public static async Task<CallToolResult> ListCategoriesAsync(
-        HeadlessLoader loader, AssetQuery assets, CancellationToken cancellationToken)
+        HeadlessLoader loader, AssetQuery assets, DisplayNameIndex names, CancellationToken cancellationToken)
     {
         if (!await loader.TryWaitReadyAsync(cancellationToken)) return ToolResults.StillLoading(loader);
 
+        // Dedupe is by display name, so give the index its usual short grace; categories that are
+        // not ready report an undeduped count and say so rather than blocking the call.
+        await names.WhenAllReadyAsync(cancellationToken: cancellationToken);
+
         var groups = new JsonArray();
+        var provisional = new List<string>();
+
         foreach (var group in CategoryCatalog.Entries.GroupBy(entry => entry.Category))
         {
             var types = new JsonArray();
@@ -47,16 +55,27 @@ public static class DiscoveryTools
 
             foreach (var entry in group)
             {
-                var count = assets.Filtered(entry).Count;
-                groupCount += count;
+                var canonical = assets.CanonicalNow(entry, names);
+                groupCount += canonical.Count;
                 exportTypes.Add(entry.Type.ToString());
-                types.Add(new JsonObject
+
+                if (!canonical.NameIndexReady && entry.DedupeDisplayNames) provisional.Add(entry.Type.ToString());
+
+                var type = new JsonObject
                 {
                     ["exportType"] = entry.Type.ToString(),
-                    ["assetCount"] = count,
+                    ["assetCount"] = canonical.Count,
+                    ["registryRows"] = canonical.RegistryRows,
                     ["classNames"] = ToolResults.ToJsonArray(entry.ClassNames),
-                    ["registryBacked"] = entry.ClassNames.Length > 0
-                });
+                    // Wildlife and WeaponMod have no item definitions at all: their assets are
+                    // hand-authored mesh paths in the catalog, so they are backed but not by classes.
+                    ["registryBacked"] = entry.ClassNames.Length > 0,
+                    ["manualAssets"] = canonical.ManualRows,
+                    ["deduped"] = entry.DedupeDisplayNames,
+                    ["collapsedDuplicates"] = canonical.CollapsedRows
+                };
+
+                types.Add(type);
             }
 
             groups.Add(new JsonObject
@@ -68,13 +87,22 @@ public static class DiscoveryTools
             });
         }
 
-        return ToolResults.Structured(new JsonObject
+        var payload = new JsonObject
         {
             ["status"] = "ok",
             ["totalRegistryEntries"] = loader.AssetRegistry.Count,
             ["categories"] = groups,
-            ["usage"] = "Pass any exportType value (e.g. \"Prop\", \"Outfit\") as the `category` argument of search_assets, browse_category or make_contact_sheet."
-        });
+            ["usage"] = "Pass any exportType value (e.g. \"Prop\", \"Outfit\") as the `category` argument of search_assets, browse_category or make_contact_sheet.",
+            ["note"] = "assetCount is the browsable count: registry rows after the category's name filters, minus rows folded onto "
+                       + "an identical display name (collapsedDuplicates), plus manualAssets - hand-authored mesh paths for categories "
+                       + "like Wildlife and WeaponMod that have no item definitions."
+        };
+
+        if (provisional.Count > 0)
+            payload["note"] = payload["note"]!.GetValue<string>() +
+                              $" Counts for {string.Join(", ", provisional)} are provisional: their display-name index is still building, so duplicates are not folded yet.";
+
+        return ToolResults.Structured(payload);
     }
 
     // ------------------------------------------------------------------ search_assets
@@ -110,10 +138,12 @@ public static class DiscoveryTools
         IEnumerable<FPartialAssetData> source;
         string? resolvedCategory = null;
         EExportType? scopedType = null;
+        AssetCategoryEntry? scopedEntry = null;
 
         if (!string.IsNullOrWhiteSpace(category))
         {
             var entry = AssetQuery.ResolveCategory(category);
+            scopedEntry = entry;
             resolvedCategory = entry.Type.ToString();
             scopedType = entry.Type;
             source = assets.Filtered(entry);
@@ -130,6 +160,10 @@ public static class DiscoveryTools
             // every category off disk well inside it) and otherwise report partial coverage.
             await names.WhenAllReadyAsync(cancellationToken: cancellationToken);
         }
+
+        // Rows the canonical list folded onto an earlier row (rarity/tier clones): still searchable,
+        // but flagged so a client knows which hit is the one browse and the sheets actually show.
+        var canonicalPaths = await CanonicalPathSetAsync(assets, names, scopedEntry, cancellationToken);
 
         // Single in-memory pass: registry substring/regex plus a dictionary hit for the display name.
         var scopedMap = scopedType is { } type ? names.MapFor(type) : null;
@@ -160,9 +194,37 @@ public static class DiscoveryTools
             }));
         }
 
+        // Hand-authored rows (Wildlife's creatures, WeaponMod's meshes) have no registry row at all,
+        // so they can only be matched here. Without this the categories look empty to every client.
+        var manualMatches = MatchManualAssets(assets, scopedEntry, predicate);
+
         var items = new JsonArray();
-        foreach (var (data, displayName, matchedOn) in matched.Skip(offset).Take(limit))
+        var nonCanonical = 0;
+
+        foreach (var manual in manualMatches.Skip(offset).Take(limit))
         {
+            items.Add(new JsonObject
+            {
+                ["name"] = manual.AssetName,
+                ["displayName"] = manual.DisplayName,
+                ["objectPath"] = manual.ObjectPath,
+                ["packagePath"] = manual.PackagePath,
+                ["assetClass"] = manual.AssetClass,
+                ["category"] = manual.AssetClass,
+                ["matchedOn"] = "displayName",
+                ["canonical"] = true,
+                ["source"] = "manual"
+            });
+        }
+
+        var registryOffset = Math.Max(0, offset - manualMatches.Count);
+        var registryLimit = Math.Max(0, limit - items.Count);
+
+        foreach (var (data, displayName, matchedOn) in matched.Skip(registryOffset).Take(registryLimit))
+        {
+            var canonical = canonicalPaths is null || canonicalPaths.Contains(data.ObjectPath);
+            if (!canonical) nonCanonical++;
+
             items.Add(new JsonObject
             {
                 ["name"] = data.AssetName.Text,
@@ -171,9 +233,15 @@ public static class DiscoveryTools
                 ["packagePath"] = data.PackageName.Text,
                 ["assetClass"] = data.AssetClass.Text,
                 ["category"] = assets.CategoryForClass(data.AssetClass.Text),
-                ["matchedOn"] = matchedOn
+                ["matchedOn"] = matchedOn,
+                // False = another row with the same display name represents this one in
+                // browse_category / make_contact_sheet. The row is still exportable.
+                ["canonical"] = canonical,
+                ["source"] = "registry"
             });
         }
+
+        var total = matched.Count + manualMatches.Count;
 
         var payload = new JsonObject
         {
@@ -181,7 +249,7 @@ public static class DiscoveryTools
             ["query"] = query,
             ["category"] = resolvedCategory,
             ["match"] = match,
-            ["total"] = matched.Count,
+            ["total"] = total,
             ["offset"] = offset,
             ["limit"] = limit,
             ["returned"] = items.Count,
@@ -199,11 +267,15 @@ public static class DiscoveryTools
         }
         else if (names.Coverage is not "complete")
         {
-            notes.Add($"Display-name coverage is {names.Coverage}: {names.ReadyCategoryCount}/{names.TotalCategoryCount} categories indexed. " +
+            notes.Add($"Display-name coverage is {names.Coverage}: {names.AvailableCategoryCount}/{names.TotalCategoryCount} categories indexed or disk-cached. " +
                       "Categories still building matched asset/package names only; pass `category` to wait for one specific category.");
         }
 
-        if (matched.Count == 0)
+        if (nonCanonical > 0)
+            notes.Add($"{nonCanonical} of the returned rows have canonical:false - they are rarity/tier clones sharing a display name " +
+                      "with another row, which is the one browse_category and make_contact_sheet show. They export fine either way.");
+
+        if (total == 0)
         {
             notes.Add($"No asset matched \"{query}\". Try a shorter or more generic term (\"hedge\" rather than \"hedge wall large\"), " +
                       "a synonym (\"foliage\", \"bush\", \"plant\"), check the spelling, drop the `category` filter, " +
@@ -214,6 +286,58 @@ public static class DiscoveryTools
         if (notes.Count > 0) payload["note"] = string.Join(" ", notes);
 
         return ToolResults.Structured(payload);
+    }
+
+    /// <summary>
+    /// Object paths the canonical list actually shows for the scoped category, so a search hit can
+    /// say whether it is the row browse/sheet will display. Null (= "assume canonical") when the
+    /// search is unscoped or the category does not dedupe, which keeps the cost off the hot path.
+    /// </summary>
+    private static async Task<HashSet<string>?> CanonicalPathSetAsync(
+        AssetQuery assets, DisplayNameIndex names, AssetCategoryEntry? entry, CancellationToken cancellationToken)
+    {
+        if (entry is not { DedupeDisplayNames: true }) return null;
+
+        var canonical = await assets.CanonicalAsync(entry, names, cancellationToken);
+        if (!canonical.NameIndexReady) return null;
+
+        return canonical.Items.Select(item => item.ObjectPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Matches the catalog's hand-authored rows, which never appear in the asset registry. Scoped to
+    /// one category when the caller passed one, otherwise across every category that has them.
+    /// </summary>
+    private static List<CategoryItem> MatchManualAssets(
+        AssetQuery assets, AssetCategoryEntry? scoped, Func<string, bool> predicate)
+    {
+        var entries = scoped is null ? CategoryCatalog.Entries : [scoped];
+        var results = new List<CategoryItem>();
+
+        foreach (var entry in entries)
+        {
+            if (entry.ManuallyDefinedAssets.Length == 0 && entry.ManuallyDefinedAssetsFactory is null) continue;
+
+            foreach (var manual in assets.ManualAssets(entry))
+            {
+                if (!predicate(manual.Name) && !predicate(manual.AssetPath)) continue;
+
+                results.Add(new CategoryItem
+                {
+                    ObjectPath = manual.AssetPath,
+                    AssetName = manual.AssetPath.SubstringAfterLast('/'),
+                    PackagePath = manual.AssetPath,
+                    AssetClass = entry.Type.ToString(),
+                    DisplayName = manual.Name,
+                    DisplayNameSource = "manual",
+                    IsManual = true,
+                    IconPath = manual.IconPath,
+                    Description = manual.Description
+                });
+            }
+        }
+
+        return results;
     }
 
     /// <summary>Compact per-request view of the display-name index, for the search reply.</summary>
@@ -235,6 +359,7 @@ public static class DiscoveryTools
         {
             ["coverage"] = names.Coverage,
             ["readyCategories"] = names.ReadyCategoryCount,
+            ["cachedCategories"] = names.CachedCategoryCount,
             ["totalCategories"] = names.TotalCategoryCount,
             ["displayNames"] = names.TotalNames
         };
@@ -244,14 +369,19 @@ public static class DiscoveryTools
 
     [McpServerTool(Name = "browse_category", ReadOnly = true, Title = "Browse a category")]
     [Description("""
-                 Pages through one category, opening each asset to read its real display name,
-                 description and gameplay tags. Style variants of the same item are collapsed onto the
-                 first occurrence (styleCount reports how many were folded in). Slower than
-                 search_assets because it loads packages - keep pageSize modest.
+                 Pages through one category, opening each asset to read its description and gameplay
+                 tags. Pages the SAME canonical list make_contact_sheet does, so with the same page
+                 and pageSize, row n here is cell n there. A page always returns pageSize rows (except
+                 the last), and total/totalPages count what you can actually reach. Duplicate rows
+                 sharing a display name are already folded away in categories that need it -
+                 collapsedDuplicates says how many were folded onto each row (that is NOT a count of
+                 style variants; use list_asset_styles for those). Slower than search_assets because
+                 it loads packages - keep pageSize modest.
                  """)]
     public static async Task<CallToolResult> BrowseCategoryAsync(
         HeadlessLoader loader,
         AssetQuery assets,
+        DisplayNameIndex names,
         [Description("Category to browse, e.g. \"Prop\" or \"Outfit\". See list_categories.")] string category,
         [Description("Zero-based page index.")] int page = 0,
         [Description("Assets per page. Capped at 100.")] int pageSize = 50,
@@ -264,48 +394,71 @@ public static class DiscoveryTools
         page = Math.Max(0, page);
         pageSize = Math.Clamp(pageSize, 1, BrowsePageSizeCap);
 
-        var rows = (IEnumerable<FPartialAssetData>) assets.Filtered(entry);
-        if (!string.IsNullOrWhiteSpace(nameFilter))
-            rows = rows.Where(data => data.AssetName.Text.Contains(nameFilter, StringComparison.OrdinalIgnoreCase));
+        var canonical = await assets.CanonicalAsync(entry, names, cancellationToken);
+        var rows = CategoryPage.Filter(canonical.Items, nameFilter);
+        var pageRows = rows.Skip(page * pageSize).Take(pageSize).ToList();
 
-        var filtered = rows.ToList();
-        var pageRows = filtered.Skip(page * pageSize).Take(pageSize).ToList();
-
-        var loaded = await LoadPageAsync(loader, entry, pageRows, cancellationToken);
+        var loaded = await LoadPageAsync(loader, pageRows, cancellationToken);
 
         var items = new JsonArray();
-        foreach (var (data, asset, displayName) in loaded)
+        for (var i = 0; i < pageRows.Count; i++)
         {
-            if (asset is null) continue;
+            var item = pageRows[i];
+            var asset = loaded[i];
 
-            var hidden = entry.HideNames.Any(name => asset.Name.Contains(name, StringComparison.OrdinalIgnoreCase))
-                         || SafeHide(entry, loaded.State, asset, displayName);
-            if (hidden && !entry.LoadHiddenAssets) continue;
-
-            items.Add(new JsonObject
+            var json = new JsonObject
             {
-                ["displayName"] = displayName,
-                ["name"] = asset.Name,
-                ["objectPath"] = data.ObjectPath,
-                ["description"] = SafeDescription(entry, asset),
-                ["tags"] = ToolResults.ToJsonArray(ReadTags(entry, asset)),
-                ["styleCount"] = loaded.State.StyleDictionary.TryGetValue(displayName, out var styles) ? styles.Count : 1,
-                ["hidden"] = hidden
-            });
+                ["index"] = page * pageSize + i,
+                ["displayName"] = item.DisplayName,
+                ["displayNameSource"] = item.DisplayNameSource,
+                ["name"] = item.AssetName,
+                ["objectPath"] = item.ObjectPath,
+                ["description"] = asset is not null ? SafeDescription(entry, asset) : item.Description ?? "No Description.",
+                ["tags"] = ToolResults.ToJsonArray(asset is not null ? ReadTags(entry, asset) : []),
+                // Rows folded onto this one because they carry an identical display name (rarity /
+                // tier clones). NOT style variants - list_asset_styles reports those.
+                ["collapsedDuplicates"] = item.CollapsedDuplicates,
+                ["hidden"] = item.Hidden
+            };
+
+            if (item.IsManual) json["source"] = "manual";
+
+            if (asset is null)
+            {
+                // For a hand-authored row this means the content is not in THIS build of Fortnite
+                // (Zombie Chicken and Klombo are both gone from 42.00, mesh and icon alike). Saying
+                // so beats rendering a magenta placeholder and leaving the caller to guess.
+                json["available"] = false;
+                json[item.IsManual ? "note" : "loadFailed"] = item.IsManual
+                    ? "This catalog entry's asset is not present in the installed Fortnite build; nothing to export."
+                    : (JsonNode) true;
+            }
+
+            items.Add(json);
         }
 
-        return ToolResults.Structured(new JsonObject
+        var payload = new JsonObject
         {
             ["status"] = "ok",
             ["category"] = entry.Type.ToString(),
             ["page"] = page,
             ["pageSize"] = pageSize,
-            ["total"] = filtered.Count,
-            ["totalPages"] = (int) Math.Ceiling(filtered.Count / (double) pageSize),
+            ["total"] = rows.Count,
+            ["totalPages"] = (int) Math.Ceiling(rows.Count / (double) pageSize),
             ["returned"] = items.Count,
-            ["note"] = "Style variants are collapsed within the page; a name already seen on an earlier page can reappear.",
+            ["registryRows"] = canonical.RegistryRows,
+            ["collapsedRows"] = canonical.CollapsedRows,
+            ["manualAssets"] = canonical.ManualRows,
+            ["note"] = "make_contact_sheet with the same category, page and pageSize renders these rows in this order, "
+                       + "so cell n is row n. collapsedDuplicates counts identically-named rows folded onto this one, not style variants.",
             ["items"] = items
-        });
+        };
+
+        if (!canonical.NameIndexReady && entry.DedupeDisplayNames)
+            payload["note"] = payload["note"]!.GetValue<string>() +
+                              $" The {entry.Type} display-name index is still building, so duplicates are not folded yet and this page may change once it finishes.";
+
+        return ToolResults.Structured(payload);
     }
 
     // ------------------------------------------------------------------ get_asset_info
@@ -338,7 +491,13 @@ public static class DiscoveryTools
             throw new McpException($"No asset could be loaded from \"{objectPath}\". Check the path with search_assets - it must be the full objectPath, not just the name.");
 
         var entry = CategoryCatalog.ForClassName(asset.ExportType);
-        var displayName = SafeDisplayName(entry, asset);
+
+        // Wildlife creatures and WeaponMod meshes are raw meshes with no item definition, so the
+        // class lookup finds nothing; the catalog is the only source of their name, category and icon.
+        var manual = assets.ManualFor(objectPath);
+        var (handlerName, nameSource) = SafeDisplayNameWithSource(entry, asset);
+        var displayName = manual?.DisplayName ?? handlerName;
+        if (manual is not null) nameSource = "manual";
 
         var payload = new JsonObject
         {
@@ -346,13 +505,25 @@ public static class DiscoveryTools
             ["objectPath"] = objectPath,
             ["name"] = asset.Name,
             ["displayName"] = displayName,
-            ["description"] = entry is not null ? SafeDescription(entry, asset) : ReadDefaultDescription(asset),
+            // displayName | assetName (prettified fallback, no localised name exists) | manual.
+            ["displayNameSource"] = nameSource,
+            ["description"] = manual?.Description
+                              ?? (entry is not null ? SafeDescription(entry, asset) : ReadDefaultDescription(asset)),
             ["assetClass"] = asset.ExportType,
-            ["category"] = entry?.Type.ToString(),
-            ["assetCategory"] = entry?.Category.ToString(),
+            ["category"] = entry?.Type.ToString() ?? manual?.AssetClass,
+            ["assetCategory"] = entry?.Category.ToString()
+                                ?? (manual is not null && Enum.TryParse<EExportType>(manual.AssetClass, out var manualType)
+                                    ? CategoryCatalog.ForType(manualType)?.Category.ToString()
+                                    : null),
             ["exportType"] = SafeExportType(asset).ToString(),
             ["tags"] = ToolResults.ToJsonArray(entry is not null ? ReadTags(entry, asset) : ReadDefaultTags(asset))
         };
+
+        if (manual is not null)
+        {
+            payload["source"] = "manual";
+            payload["catalogIconPath"] = manual.IconPath;
+        }
 
         // Rarity / series / set --------------------------------------------------
         if (entry is null || !entry.HideRarity)
@@ -460,65 +631,54 @@ public static class DiscoveryTools
 
     internal static readonly AssetCategoryEntry DefaultEntry = new() { Type = EExportType.None };
 
-    internal sealed class LoadedPage : List<(FPartialAssetData Data, UObject? Asset, string DisplayName)>
-    {
-        public AssetEnumerationState State { get; } = new();
-    }
-
     /// <summary>
-    /// Loads a page of assets and primes the style dictionary. A FRESH AssetEnumerationState per
-    /// call is mandatory: reusing one silently dedupes everything away on the second request.
+    /// Loads one page of assets in parallel, index-for-index with the canonical rows handed in. A
+    /// null slot means the package would not open; the row is still reported, flagged loadFailed,
+    /// so paging never silently shortens.
     /// </summary>
-    internal static async Task<LoadedPage> LoadPageAsync(
-        HeadlessLoader loader, AssetCategoryEntry entry, List<FPartialAssetData> rows, CancellationToken cancellationToken)
+    internal static async Task<UObject?[]> LoadPageAsync(
+        HeadlessLoader loader, List<CategoryItem> rows, CancellationToken cancellationToken)
     {
-        var page = new LoadedPage();
-        var slots = new (FPartialAssetData Data, UObject? Asset, string DisplayName)[rows.Count];
+        var slots = new UObject?[rows.Count];
 
         await Parallel.ForEachAsync(
             Enumerable.Range(0, rows.Count),
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount / 2), CancellationToken = cancellationToken },
             async (i, ct) =>
             {
-                var data = rows[i];
-                UObject? asset = null;
                 try
                 {
-                    asset = await loader.Provider.SafeLoadPackageObjectAsync(data.ObjectPath);
+                    slots[i] = await loader.Provider.SafeLoadPackageObjectAsync(rows[i].ObjectPath);
                 }
                 catch (Exception e)
                 {
-                    Log.Debug("browse: failed to load {Path}: {Message}", data.ObjectPath, e.Message);
+                    Log.Debug("browse: failed to load {Path}: {Message}", rows[i].ObjectPath, e.Message);
                 }
-
-                var displayName = asset is null ? data.AssetName.Text : SafeDisplayName(entry, asset);
-                slots[i] = (data, asset, displayName);
-                await Task.CompletedTask;
             });
 
-        // Style collection is a second, ordered pass so styleCount is final before items are emitted.
-        foreach (var slot in slots)
-        {
-            if (slot.Asset is null) continue;
-            try { entry.AddStyleHandler(page.State, slot.Asset, slot.DisplayName); }
-            catch (Exception e) { Log.Debug("browse: style handler threw: {Message}", e.Message); }
-        }
-
-        page.AddRange(slots);
-        return page;
+        return slots;
     }
 
+    /// <summary>
+    /// The label for a loaded asset. Falls back to a prettified asset name rather than the raw
+    /// internal one, so a dev row with no localised name reads "Guitar Figure", not "SID_Guitar_Figure".
+    /// </summary>
     internal static string SafeDisplayName(AssetCategoryEntry? entry, UObject asset)
+        => SafeDisplayNameWithSource(entry, asset).Name;
+
+    internal static (string Name, string Source) SafeDisplayNameWithSource(AssetCategoryEntry? entry, UObject asset)
     {
         try
         {
             var name = (entry ?? DefaultEntry).DisplayNameHandler(asset);
-            return string.IsNullOrWhiteSpace(name) ? asset.Name : name;
+            if (!string.IsNullOrWhiteSpace(name)) return (name, "displayName");
         }
         catch
         {
-            return asset.Name;
+            // Handlers walk soft references and can throw on partially-cooked assets.
         }
+
+        return (CategoryCatalog.PrettifyAssetName(asset.Name), "assetName");
     }
 
     private static string SafeDescription(AssetCategoryEntry entry, UObject asset)
@@ -531,12 +691,6 @@ public static class DiscoveryTools
     {
         try { return DefaultEntry.DescriptionHandler(asset) ?? "No Description."; }
         catch { return "No Description."; }
-    }
-
-    private static bool SafeHide(AssetCategoryEntry entry, AssetEnumerationState state, UObject asset, string displayName)
-    {
-        try { return entry.HidePredicate(state, asset, displayName); }
-        catch { return false; }
     }
 
     private static IEnumerable<string> ReadTags(AssetCategoryEntry entry, UObject asset)
@@ -761,6 +915,27 @@ public static class DiscoveryTools
         catch { /* optional */ }
 
         return null;
+    }
+}
+
+/// <summary>
+/// The single place a category's canonical list is narrowed and sliced. browse_category and
+/// make_contact_sheet both go through it, which is what keeps "browse row n == sheet cell n" true
+/// for the same category/page/pageSize.
+/// </summary>
+public static class CategoryPage
+{
+    /// <summary>Applies an optional case-insensitive substring filter over name, path and label.</summary>
+    public static List<CategoryItem> Filter(IReadOnlyList<CategoryItem> items, string? query)
+    {
+        if (string.IsNullOrWhiteSpace(query)) return items as List<CategoryItem> ?? items.ToList();
+
+        return items
+            .Where(item =>
+                item.AssetName.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                item.PackagePath.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                item.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .ToList();
     }
 }
 

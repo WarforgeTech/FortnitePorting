@@ -64,6 +64,13 @@ public record ExportedAsset
     /// <summary>Caller-facing warnings about work the exporter attempted but could not finish.</summary>
     public List<string> Notes { get; init; } = [];
 
+    /// <summary>
+    /// Primary artifacts the export model said it produced but which are NOT on disk - the exact
+    /// shape of the silent-success bug: ExportContext catches per-file conversion failures, logs a
+    /// warning and carries on, so an emote could report success with no animation in it.
+    /// </summary>
+    public List<string> MissingArtifacts { get; init; } = [];
+
     public long Bytes => Files.Sum(file => file.Bytes);
 }
 
@@ -140,10 +147,28 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
 
             var single = await ExportOne(asset, objectPath, opts, token);
             if (single.Failure is not null) result.Failures.Add(single.Failure);
-            if (single.Asset is not null) result.Assets.Add(single.Asset);
+            if (single.Asset is not null)
+            {
+                result.Assets.Add(single.Asset);
+                AddMissingArtifactFailure(result.Failures, objectPath, single.Asset);
+            }
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// A partial export is a failure the caller must be able to see in <c>failures[]</c>, not only
+    /// as a note buried in the asset entry. The asset still appears in <c>assets[]</c> with the
+    /// files that did land.
+    /// </summary>
+    private static void AddMissingArtifactFailure(List<ExportFailure> failures, string objectPath, ExportedAsset asset)
+    {
+        if (asset.MissingArtifacts.Count == 0) return;
+
+        failures.Add(new ExportFailure(objectPath,
+            $"Export completed but is missing its primary artifact(s) - {string.Join(" ", asset.MissingArtifacts)} "
+            + $"{asset.Files.Count} other file(s) were written."));
     }
 
     /// <summary>
@@ -197,7 +222,11 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             var single = await ExportOne(member.Object, member.ObjectPath, propOptions, token);
 
             if (single.Failure is not null) result.Failures.Add(single.Failure);
-            if (single.Asset is not null) result.Props.Add(single.Asset);
+            if (single.Asset is not null)
+            {
+                result.Props.Add(single.Asset);
+                AddMissingArtifactFailure(result.Failures, member.ObjectPath, single.Asset);
+            }
 
             // Do not leave a folder behind for a prop that produced nothing.
             try
@@ -423,6 +452,11 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             // an empty folder named after every asset it writes. Sweep those away.
             if (opts.OutputDir is not null) PruneNewEmptyDirectories(outputRoot, directoriesBefore);
 
+            var missing = CollectMissingArtifacts(export, files);
+            if (missing.Count > 0)
+                Log.Warning("Export of {Name} ({Type}) is missing primary artifacts: {Missing}",
+                    displayName, exportType, string.Join(" ", missing));
+
             return new SingleExport(new ExportedAsset
             {
                 ObjectPath = asset.GetPathName(),
@@ -432,7 +466,8 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 Files = files,
                 AppliedStyles = appliedStyles,
                 Parts = DescribeParts(export),
-                Notes = CollectNotes(export, files)
+                MissingArtifacts = missing,
+                Notes = CollectNotes(missing)
             }, null);
         }
         catch (Exception e)
@@ -638,27 +673,102 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
     }
 
     /// <summary>
-    /// Turns silent exporter shortfalls into something the caller can read. Animation conversion is
-    /// the one that bites: Fortnite's sequences are ACL-compressed and the converter needs the native
-    /// CUE4Parse-Natives library. When it is absent the exporter logs a warning and carries on, so
-    /// without this note an animation-bearing export would report success with no animation file.
+    /// The silent-success guard. <c>ExportContext.ExportAsync</c> (in the shared
+    /// FortnitePorting.Exporting project) catches every per-file conversion failure, logs it as a
+    /// warning and continues, so a failed conversion never reaches this project's Failures list.
+    /// Rather than scrape Serilog, this checks the ground truth: the export MODEL says which
+    /// primary artifacts it resolved, so anything it named that is not on disk was dropped.
+    /// <para>
+    /// Checked per kind: a mesh export must write at least one mesh file, an export carrying an
+    /// animation must write at least one .ueanim/.psa, and a resolved pose asset must write a
+    /// .uepose. Textures are deliberately not required - materials legitimately resolve to nothing.
+    /// </para>
     /// </summary>
-    private static List<string> CollectNotes(BaseExport export, List<ExportedFile> files)
+    private static List<string> CollectMissingArtifacts(BaseExport export, List<ExportedFile> files)
     {
-        var notes = new List<string>();
-        if (export is not MeshExport { Animation: { } animation } || animation.Sections.Count == 0) return notes;
+        var missing = new List<string>();
 
-        var wroteAnimation = files.Any(file =>
-            file.Path.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) ||
-            file.Path.EndsWith(".psa", StringComparison.OrdinalIgnoreCase));
+        bool Wrote(params string[] extensions) => files.Any(file =>
+            extensions.Any(extension => file.Path.EndsWith(extension, StringComparison.OrdinalIgnoreCase)));
 
-        if (!wroteAnimation)
-            notes.Add($"The lobby idle montage \"{animation.Name}\" was resolved but produced no animation file. "
-                      + "Fortnite animations are ACL-compressed and need the native CUE4Parse-Natives library, which is "
-                      + "not available in this build. Meshes and textures are unaffected.");
+        bool WroteAnimation() => Wrote(".ueanim", ".psa");
+
+        // Emote / Animation exports. An AnimExport that found a montage always sets Skeleton, then
+        // fills Sections from Context.AnimSequence - which returns NULL on a conversion failure. So
+        // "a skeleton but no sections" is the exact fingerprint of a dropped animation, and an empty
+        // Sections list can never be trusted as "this asset simply has no animation".
+        if (export is AnimExport anim)
+        {
+            if (anim.Skeleton is not null && !WroteAnimation())
+                missing.Add(anim.Sections.Count == 0
+                    ? $"animation: a montage was resolved for \"{export.Name}\" but every section failed to convert, so no .ueanim/.psa was written."
+                    : $"animation: {anim.Sections.Count} section(s) were resolved but no .ueanim/.psa was written.");
+
+            return missing;
+        }
+
+        if (export is not MeshExport mesh) return missing;
+
+        var meshes = EnumerateMeshes(mesh).Where(item => !string.IsNullOrEmpty(item.Path)).ToList();
+        if (meshes.Count > 0 && !Wrote(".uemodel", ".psk", ".pskx", ".glb", ".gltf", ".usda"))
+            missing.Add($"mesh: the export resolved {meshes.Count} mesh(es) (first: \"{meshes[0].Name}\") but no mesh file was written.");
+
+        // Outfit lobby poses take this path: MeshExport.Animation is the montage.
+        if (mesh.Animation is { } montage && (montage.Skeleton is not null || montage.Sections.Count > 0) && !WroteAnimation())
+            missing.Add($"animation: \"{montage.Name}\" resolved {montage.Sections.Count} section(s) but no .ueanim/.psa was written.");
+
+        var poses = meshes.OfType<ExportPart>()
+            .Count(part => part.Meta is ExportPoseAssetMeta { PoseAsset.Length: > 0 });
+        if (poses > 0 && !Wrote(".uepose"))
+            missing.Add($"poseAsset: {poses} part(s) resolved a facial pose asset but no .uepose was written.");
+
+        return missing;
+    }
+
+    /// <summary>Human-readable advice attached to whatever <see cref="CollectMissingArtifacts"/> found.</summary>
+    private static List<string> CollectNotes(IReadOnlyList<string> missing)
+    {
+        if (missing.Count == 0) return [];
+
+        var notes = new List<string>
+        {
+            "This export is INCOMPLETE: " + string.Join(" ", missing)
+            + " The exporter logs per-file conversion failures as warnings and continues, so the files that did land are still valid."
+        };
+
+        if (missing.Any(item => item.StartsWith("animation", StringComparison.Ordinal)) && !NativeAnimationSupport)
+            notes.Add("Fortnite animations are ACL-compressed and need the native CUE4Parse-Natives library, which this "
+                      + "build could not load. Place CUE4Parse-Natives.dll next to the executable (see runtimes/README.md).");
 
         return notes;
     }
+
+    /// <summary>
+    /// Whether the unmanaged ACL decoder is loadable in this process. False means every
+    /// ACL-compressed UAnimSequence - i.e. every Fortnite emote - will fail to convert.
+    /// Probed once; surfaced by get_status as <c>nativeAnimationSupport</c>.
+    /// </summary>
+    public static bool NativeAnimationSupport => NativeProbe.Value;
+
+    private static readonly Lazy<bool> NativeProbe = new(() =>
+    {
+        try
+        {
+            var found = System.Runtime.InteropServices.NativeLibrary.TryLoad(
+                "CUE4Parse-Natives", typeof(ExportRunner).Assembly, searchPath: null, out _);
+
+            if (!found)
+                Log.Warning("CUE4Parse-Natives could not be loaded: ACL-compressed animations (every Fortnite emote) "
+                            + "will export without a .ueanim. See FortnitePorting.Mcp/runtimes/README.md.");
+
+            return found;
+        }
+        catch (Exception e)
+        {
+            Log.Warning("CUE4Parse-Natives probe failed: {Message}", e.Message);
+            return false;
+        }
+    });
 
     /// <summary>
     /// Flattens the character parts a mesh export produced. Base parts come from

@@ -243,6 +243,22 @@ public static class ExportTools
                 });
             }
 
+            if (exportType is EExportType.Sprite &&
+                await ReadSpriteVariantsAsync(services, asset) is { Count: > 0 } spriteVariants)
+            {
+                channels.Add(new JsonObject
+                {
+                    ["channel"] = "Variant",
+                    ["variantType"] = "SiblingExtractableDefinitions",
+                    ["multiSelect"] = true,
+                    ["options"] = new JsonArray(spriteVariants.Select(variant => (JsonNode) new JsonObject
+                    {
+                        ["name"] = variant.Name,
+                        ["objectPath"] = variant.ObjectPath
+                    }).ToArray())
+                });
+            }
+
             return Structured(new JsonObject
             {
                 ["objectPath"] = asset.GetPathName(),
@@ -252,7 +268,10 @@ public static class ExportTools
                 ["channelCount"] = channels.Count,
                 ["channels"] = channels,
                 ["usage"] = styleChannels.Count == 0
-                    ? "This asset has no style channels; export_assets will export its base look."
+                    ? channels.Count == 0
+                        ? "This asset has no style channels; export_assets will export its base look."
+                        : "This asset has no ItemVariants style channels, but the channels listed above enumerate SEPARATE assets. "
+                          + "Export them by passing their objectPath to export_assets (or export_gallery for a prefab), not via `styles`."
                     : "Pass styles:\"all\" to export_assets for every option at once, or styles:{"
                       + string.Join(", ", styleChannels.Select(channel => $"\"{channel.Channel}\":\"{channel.Options[0].Name}\""))
                       + "} to pick one option per channel."
@@ -339,6 +358,55 @@ public static class ExportTools
                 : null,
             ["json"] = body
         });
+    }
+
+    /// <summary>
+    /// Sprite style variants are not ItemVariants: each one is its own ExtractableItemDefinition
+    /// named <c>&lt;parent&gt;_Variant_&lt;Style&gt;</c> that points back at the parent through
+    /// <c>ParentExtractableDefinition</c>. The registry gives the candidates for free (name prefix,
+    /// no package loads); only those few are then opened to confirm the parent link, so a coincidental
+    /// name match cannot fabricate a variant.
+    /// </summary>
+    private static async Task<List<(string Name, string ObjectPath)>> ReadSpriteVariantsAsync(
+        IServiceProvider services, UObject parent)
+    {
+        var variants = new List<(string, string)>();
+
+        try
+        {
+            var assets = services.GetService<AssetQuery>();
+            var loader = services.GetRequiredService<HeadlessLoader>();
+            if (assets is null || CategoryCatalog.ForType(EExportType.Sprite) is not { } entry) return variants;
+
+            var parentPath = parent.GetPathName();
+            var prefix = $"{parent.Name}_Variant_";
+
+            foreach (var data in assets.Filtered(entry))
+            {
+                var assetName = data.AssetName.Text;
+                if (!assetName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+                var candidate = await loader.Provider.SafeLoadPackageObjectAsync(data.ObjectPath);
+                if (candidate is null) continue;
+
+                var link = candidate.GetOrDefault<FSoftObjectPath?>("ParentExtractableDefinition");
+                if (link is null) continue;
+
+                var linkPath = link.Value.AssetPathName.Text;
+                if (!string.IsNullOrEmpty(linkPath) &&
+                    !parentPath.StartsWith(linkPath.SubstringBeforeLast('.'), StringComparison.OrdinalIgnoreCase) &&
+                    !linkPath.Contains(parent.Name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                variants.Add((assetName[prefix.Length..], data.ObjectPath));
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug("Sprite variant scan failed for {Name}: {Message}", parent.Name, e.Message);
+        }
+
+        return variants;
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -483,20 +551,35 @@ public static class ExportTools
         return true;
     }
 
-    private static JsonObject Describe(ExportResult result) => new()
+    private static JsonObject Describe(ExportResult result)
     {
-        ["outputRoot"] = result.OutputRoot,
-        ["assetsExported"] = result.Assets.Count,
-        ["totalFiles"] = result.TotalFiles,
-        ["totalBytes"] = result.TotalBytes,
-        ["assets"] = new JsonArray(result.Assets.Select(DescribeAsset).ToArray()),
-        ["failures"] = new JsonArray(result.Failures
-            .Select(failure => (JsonNode) new JsonObject
-            {
-                ["objectPath"] = failure.ObjectPath,
-                ["error"] = failure.Error
-            }).ToArray())
-    };
+        var incomplete = result.Assets.Count(asset => asset.MissingArtifacts.Count > 0);
+
+        var json = new JsonObject
+        {
+            // "ok" only when every asset produced its primary artifact. An export that wrote files
+            // but dropped the mesh/animation it resolved is "partial", never a clean success.
+            ["status"] = result.Failures.Count == 0 ? "ok" : result.Assets.Count > 0 ? "partial" : "error",
+            ["outputRoot"] = result.OutputRoot,
+            ["assetsExported"] = result.Assets.Count,
+            ["assetsIncomplete"] = incomplete,
+            ["totalFiles"] = result.TotalFiles,
+            ["totalBytes"] = result.TotalBytes,
+            ["assets"] = new JsonArray(result.Assets.Select(DescribeAsset).ToArray()),
+            ["failures"] = new JsonArray(result.Failures
+                .Select(failure => (JsonNode) new JsonObject
+                {
+                    ["objectPath"] = failure.ObjectPath,
+                    ["error"] = failure.Error
+                }).ToArray())
+        };
+
+        if (incomplete > 0)
+            json["note"] = $"{incomplete} asset(s) wrote files but are missing a primary artifact - see missingArtifacts on each "
+                           + "and the matching entry in failures. The files that did land are valid.";
+
+        return json;
+    }
 
     private static JsonNode DescribeAsset(ExportedAsset asset)
     {
@@ -518,6 +601,12 @@ public static class ExportTools
 
         if (asset.AppliedStyles.Count > 0)
             json["appliedStyles"] = ToolResults.ToJsonArray(asset.AppliedStyles);
+
+        if (asset.MissingArtifacts.Count > 0)
+        {
+            json["complete"] = false;
+            json["missingArtifacts"] = ToolResults.ToJsonArray(asset.MissingArtifacts);
+        }
 
         if (asset.Notes.Count > 0)
             json["notes"] = ToolResults.ToJsonArray(asset.Notes);

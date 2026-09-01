@@ -174,3 +174,86 @@ driven through `--call` (the same dispatch path the MCP server uses).
 * The stdio JSON-RPC harness referenced in the earlier rounds is not checked into this repo, so this round was
   verified through `--call` (identical dispatch) and `--tools` rather than over the wire.
 * Fix 2 (`shareTextures`) remains queued.
+
+---
+
+# Defect fix round — D1-D12 from the category audit
+
+Source: `category-audit/AUDIT.md` (audited at `98f57f6f`, exe build 2026-08-31 19:58, Fortnite 42.00,
+569,456 registry rows). Fixed on top of `c3228b8c`.
+All "after" figures come from `publish\mcp\FortnitePorting.Mcp.exe` with
+`FPMCP_CONFIG=C:/Users/texas/.fortniteporting-mcp.json`.
+
+**Gate:** `dotnet build -c Release` 0 errors · `--selftest` PASSED (6.6 s, 12 tools) ·
+`dotnet publish -c Release -o publish\mcp` OK, `CUE4Parse-Natives.dll` present in the publish output.
+
+## Per-defect before / after
+
+| # | Sev | Before | After | Evidence |
+|---|---|---|---|---|
+| **D1a** | blocker | Emote export wrote only `.wav` + base skeleton `.uemodel`; `DllNotFoundException: CUE4Parse-Natives` in the log | `.ueanim` produced | `EID_TakeTheL` → **`Emote_Dance_Loser_CMM.ueanim`, 28,458 bytes** alongside the 2,425,308 B wav and 9,348 B skeleton. `get_status` now reports `nativeAnimationSupport: true`. |
+| **D1b** | blocker | `assetsExported:1, failures:[]` while the primary artifact was silently dropped | Partial exports surface as failures | With the DLL moved aside, the same call returns `status:"partial"`, `assetsIncomplete:1`, `complete:false`, `missingArtifacts:["animation: 1 section(s) were resolved but no .ueanim/.psa was written."]`, a matching `failures[]` entry and a note naming the missing native. With the DLL present: `status:"ok"`, `assetsIncomplete:0`. |
+| **D2** | blocker | WeaponMod 0 assets, Wildlife 0 assets; `ManuallyDefinedAssets` unreferenced dead code | WeaponMod **52**, Wildlife **13** | `list_categories` → `WeaponMod assetCount 52 (manualAssets 52)`, `Wildlife 13 (manualAssets 13)`. `search_assets {"query":"wolf","category":"Wildlife"}` → 1 hit `Wolf` (was 0); `"boar"` → 1 hit `Boar`. Wildlife contact sheet renders 13 cells, 11 real creature icons with correct labels (visually inspected). WeaponMod sheet p0: 24/24 real. Export through the category's own path: `OpticCherrySmoke.uemodel` + 4 textures, `status:"ok"`. |
+| **D3** | major | Item 38.3 %, Resource 20.0 %, Trap 16.7 % real icons; whole pages 24/24 magenta | **Item 91.7 %, Resource 100 %, Trap 100 %** (target ≥80 %) | `--iconcoverage 60 --category X`. Deep pages: Item p40 19/24 real (was 0/24), Trap last page 18/18, Resource last page 12/13. Every hidden family was verified artless first by sampling it directly (`make_contact_sheet` with a path query): `/SaveTheWorld/Items/Weapons/` 0 real of 96 sampled (3,784 rows), `/SaveTheWorld/Items/Traps/` 0 of 96 (347 rows), Juno ingredients 0 of 96 (220 rows), `/SaveTheWorld/Items/Ingredients/` 0 of 46, `DIsguiseDevice_SW` 0 of 48 (61 rows), `/Sprout` 0 of 96 (234 rows). All stay findable via `search_files` and exportable by direct objectPath. |
+| **D3 bonus** | — | Emote 96.7 % | **Emote 100 %** | Same command. |
+| **D4** | major | `browse_category Trap pageSize 6` → `returned 3`, `total 444`; sheet cell *n* ≠ browse row *n* | Both page ONE canonical list | Trap p0 pageSize 6 → `returned 6`, `total 66`, `totalPages 11`; the sheet at the same page/pageSize returns 6 cells and all six `objectPath`s match row-for-row (Armored Wall, Team Settings and Inventory, Item Spawner Plate, Barrier, Elimination Zone, Weapon-free zone). `Item pageSize 8` → `returned 8` (was 5). All 28 categories return exactly pageSize rows at p0. |
+| **D5** | major | All 1,005 Banners displayed `Banner Icon`; display-name search dead there | Real names | `browse_category Banner` → Akita, Alpaca Lean, Anvil Alarm, Aqua Peony, Ashen Magus, Baller Leag. `search_assets {"query":"Ashen","category":"Banner"}` → 1 hit, `matchedOn:"both"`. ("Peely" still returns 0: there is no Peely banner in 42.00, so the original repro was a bad example rather than a bug.) |
+| **D6** | major | `nameIndex: coverage "none", 0/28 ready`, every category `notBuilt`, while search worked | `coverage "complete", 28/28 usable` | Fresh process `get_status` → `readyCategories 0, cachedCategories 26, usableCategories 28/28, availableDisplayNames 127,887`; Wildlife/WeaponMod report `catalog` (not registry-backed, nothing to index) rather than `notBuilt`. Costs 67 ms and still never blocks: the probe reads only the `Count` header of each cache file. |
+| **D7** | minor | Emote p0 was 16/24 identical white `EID_CT_CapturePose_*` silhouettes | Gone | Moved to `DisallowedNames`, which is applied even under `LoadHiddenAssets` (the existing `HideNames = ["_CT", ...]` never fired for exactly that reason). Emote sheet p0 is now 24 distinct real emotes: Crash's Victory, Lush Life, Egg Mobile, Super Shadow Transformation, … |
+| **D8** | minor | Dev rows leaked raw asset names as display names | Prettified fallback, source labelled | `SID_Guitar_Figure` → **"Guitar Figure"** with `displayNameSource:"assetName"`; localised rows report `displayNameSource:"displayName"`. Also on `get_asset_info`. The search index still stores only genuine localised names. |
+| **D9** | minor | Item searches flooded by rarity clones, undisclosed | Annotated | `search_assets {"query":"shotgun","category":"Item"}` → `WID_ArcadeShotgun_C canonical:true`, `_R/_SR/_UC/_VR canonical:false`, plus a note explaining that the `canonical:true` row is the one browse and the sheets show. Full coverage kept, so an exact clone name still resolves. |
+| **D10** | minor | `list_asset_styles` on `ESD_AirSprite` → `channelCount 0` although variants exist | `channelCount 1` | Channel `Variant` / `SiblingExtractableDefinitions` with A, Candy, Galaxy, Gold, Holofoil and their objectPaths, plus usage text saying to export them as separate paths rather than through `styles`. Candidates come from the registry by name prefix, then each is opened to confirm its `ParentExtractableDefinition`. |
+| **D11** | minor | `styleCount` meant "rows folded by identical display name", read as "style variants" | Renamed | `browse_category` emits `collapsedDuplicates` (0 = unique), documented in the tool description and in the reply note as explicitly not a style count. `list_categories` reports per-category `deduped` and `collapsedDuplicates` totals. |
+| **D12** | minor | All 109 vehicles `"No Description."`; duplicate display names indistinguishable | Both addressed | `FortVehicleItemDefinition` genuinely ships no Description (verified by dumping one), so the handler surfaces what it does hold: `"Spawn names: battlebus, armoredbus. Actor class: ArmoredBattleBus_Vehicle."`. Duplicates get a discriminator: `ArmoredTruck (VID_Valet_ArmoredTruck)` vs `ArmoredTruck (VID_Valet_ArmoredTruck_VaultDestroyed)`. |
+
+## Category counts, before → after
+
+Filtering and dedupe changed what "browsable" means, so the headline counts moved:
+
+| Category | audit n | now | why |
+|---|---:|---:|---|
+| Item | 7,020 | 1,230 | 4,079 artless rows hidden, 1,711 rarity clones folded |
+| Trap | 444 | 66 | 347 STW tier rows hidden, 31 folded |
+| Resource | 384 | 109 | 275 Juno / STW / Sprout rows hidden |
+| Prop | 105,512 | 26,620 | 78,892 duplicate display names folded (this dedupe used to run per-page, so `total` overstated what you could reach) |
+| Emote | 2,171 | 2,156 | 15 CapturePose dev rigs hidden |
+| WeaponMod | 0 | 52 | manual assets wired in |
+| Wildlife | 0 | 13 | manual assets wired in |
+
+Every other category is unchanged.
+
+## Design notes
+
+* **One canonical list.** `AssetQuery.CanonicalAsync` builds, per category, the deduped and ordered
+  `CategoryItem` list that `browse_category`, `make_contact_sheet`, `list_categories` and `search_assets`
+  all use. `Filtered` (raw registry rows) stays as the layer `DisplayNameIndex` builds from — the index
+  cannot depend on a list deduped by the names it produces. Dedupe is therefore display-name driven and
+  waits briefly for that category's index; if the index is not ready the list is returned undeduped, is
+  **not** cached, and the reply says so.
+* **The `HidePredicate` / `AddStyleHandler` delegates and `AssetEnumerationState` are gone.** They only
+  ever ran over a single page, which is what made browse and the sheets disagree. They are replaced by
+  the declarative `DedupeDisplayNames` / `DisambiguateDuplicateNames` flags the canonical builder applies
+  to the whole category.
+* **Name-index cache schema bumped to v2** (`{version}|{rows}|v2`) so Banner caches written by older
+  builds, holding 1,005 copies of "Banner Icon", are discarded. Full rebuild of all 28 categories: 9.1 s.
+* **`runtimes/CUE4Parse-Natives.dll`** is committed with a README recording its provenance (extracted from
+  the official FortnitePorting v4.3.2 self-contained build, same CUE4Parse fork) and how to rebuild it via
+  CMake. The csproj copies it to the root of both build and publish output, next to the exe.
+
+## Left open
+
+* **Prop page 0 is still placeholder-heavy** (14/24 real). Alphabetical ordering lands it on the Akita
+  pipe props; random-sample coverage for Prop is 100 %, so this is an ordering artefact, not missing art.
+  Out of scope for this round — the audit flagged it as a Prop-owner concern.
+* **Item is 91.7 %, not 100 %.** The remaining misses are scattered singletons — `AGID_HeroTransformation_*`,
+  one Mars enemy fist, an STW tower grenade — with no family to hide. Suppressing them individually would
+  risk hiding real content for a few percent.
+* **Zombie Chicken and Klombo** are catalog Wildlife entries whose mesh AND icon are absent from Fortnite
+  42.00 (`search_files` finds neither `Chicken_Zombie_Bird` nor `Butter_Cake_Mammal`). They are kept in the
+  catalog — the content may return — but `browse_category` now reports `available:false` with an
+  explanatory note and the sheet legend marks the cell, instead of silently showing magenta.
+* **`ExportContext.cs:117` is untouched**, as briefed. The silent swallow is compensated on the MCP side by
+  checking the export model's resolved artifacts against what actually landed on disk. It is not a fix to
+  the shared exporter, so a GUI export still swallows the same failures.
+* Vehicle `tags[]` is still empty: vehicle DataLists carry `Traits`, not the `Tags` container the shared
+  gameplay-tag handler reads. Left alone rather than guessing at the struct shape.
