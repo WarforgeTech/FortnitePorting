@@ -47,6 +47,9 @@ try
     if (args.Contains("--iconcoverage", StringComparer.OrdinalIgnoreCase))
         return await CliModes.IconCoverageAsync(config, args);
 
+    if (args.Contains("--outfitaudit", StringComparer.OrdinalIgnoreCase))
+        return await CliModes.OutfitAuditAsync(config, args);
+
     if (args.Contains("--nameindex", StringComparer.OrdinalIgnoreCase))
         return await CliModes.BuildNameIndexAsync(config, args);
 
@@ -329,12 +332,15 @@ internal static class CliModes
             .ToList();
 
         var tally = new Dictionary<string, int>();
+        var misses = new List<(string ObjectPath, string Source)>();
         var started = DateTime.Now;
 
         foreach (var data in sample)
         {
             var result = await icons.ResolveAsync(data.ObjectPath, 128);
             tally[result.SourceName] = tally.GetValueOrDefault(result.SourceName) + 1;
+
+            if (!result.IsRealIcon) misses.Add((data.ObjectPath, result.SourceName));
         }
 
         var real = tally.GetValueOrDefault("handler") + tally.GetValueOrDefault("rawTexture");
@@ -343,10 +349,107 @@ internal static class CliModes
         foreach (var (source, hits) in tally.OrderByDescending(pair => pair.Value))
             Log.Information("  {Source,-12} {Hits,4} ({Percent:N1}%)", source, hits, hits * 100.0 / sample.Count);
 
+        // Naming the misses is the whole point of the diagnostic: it says whether the gap is real
+        // artwork the chain failed to find, or test/NPC entries that genuinely ship without one.
+        foreach (var (objectPath, source) in misses.DistinctBy(miss => miss.ObjectPath).Take(40))
+            Log.Information("  MISS  {Source,-11} {Path}", source, objectPath);
+
         Log.Information("Real-icon coverage: {Real}/{Total} = {Percent:N1}% in {Seconds:N1}s",
             real, sample.Count, percent, (DateTime.Now - started).TotalSeconds);
 
         return percent >= 90 ? 0 : 2;
+    }
+
+    /// <summary>
+    /// Diagnostic: samples outfits and reports how their character parts resolve - which source the
+    /// exporter would use (BaseCharacterParts vs the HeroDefinition fallback), which part types are
+    /// present, and which parts carry no SkeletalMesh and would therefore export nothing. Used to
+    /// prove outfit exports are part-complete rather than silently short.
+    /// </summary>
+    public static async Task<int> OutfitAuditAsync(McpConfig config, string[] args)
+    {
+        var count = int.TryParse(McpConfig.GetArgumentValue(args, "--outfitaudit"), out var parsed) ? parsed : 100;
+        var categoryName = McpConfig.GetArgumentValue(args, "--category") ?? "Outfit";
+        var seed = int.TryParse(McpConfig.GetArgumentValue(args, "--seed"), out var parsedSeed) ? parsedSeed : 1234;
+
+        var services = new ServiceCollection();
+        McpServices.Register(services, config);
+        await using var provider = services.BuildServiceProvider();
+
+        var loader = provider.GetRequiredService<HeadlessLoader>();
+        await loader.WaitReadyAsync();
+
+        var query = provider.GetRequiredService<AssetQuery>();
+        var entry = AssetQuery.ResolveCategory(categoryName);
+        var rows = query.Filtered(entry);
+
+        var random = new Random(seed);
+        var sample = Enumerable.Range(0, Math.Min(count, rows.Count))
+            .Select(_ => rows[random.Next(rows.Count)])
+            .DistinctBy(data => data.ObjectPath)
+            .ToList();
+
+        Log.Information("Outfit part audit: {Count} of {Total:N0} {Category} assets (seed {Seed})",
+            sample.Count, rows.Count, entry.Type, seed);
+
+        var bySource = new Dictionary<string, int>();
+        var byPartType = new Dictionary<string, int>();
+        var noParts = new List<string>();
+        var noBody = new List<string>();
+        var meshless = new List<string>();
+        var heroOnly = new List<string>();
+        var unloadable = new List<string>();
+        var started = DateTime.Now;
+
+        foreach (var data in sample)
+        {
+            var asset = await loader.Provider.SafeLoadPackageObjectAsync(data.ObjectPath);
+            if (asset is null)
+            {
+                unloadable.Add(data.ObjectPath);
+                continue;
+            }
+
+            var set = CharacterPartInspector.Read(asset);
+            bySource[set.Source] = bySource.GetValueOrDefault(set.Source) + 1;
+
+            foreach (var partType in set.PartTypes)
+                byPartType[partType] = byPartType.GetValueOrDefault(partType) + 1;
+
+            if (set.Parts.Count == 0) noParts.Add(data.ObjectPath);
+            else if (!set.PartTypes.Contains("Body")) noBody.Add($"{data.AssetName.Text} [{string.Join(",", set.PartTypes)}]");
+
+            if (set.Source is "HeroDefinition.Specializations") heroOnly.Add(data.ObjectPath);
+
+            foreach (var part in set.MeshlessParts)
+                meshless.Add($"{data.AssetName.Text} -> {part.Name} ({part.PartType})");
+        }
+
+        Log.Information("Part source:");
+        foreach (var (source, hits) in bySource.OrderByDescending(pair => pair.Value))
+            Log.Information("  {Source,-30} {Hits,4} ({Percent:N1}%)", source, hits, hits * 100.0 / sample.Count);
+
+        Log.Information("Part types present (outfits containing at least one):");
+        foreach (var (partType, hits) in byPartType.OrderByDescending(pair => pair.Value))
+            Log.Information("  {PartType,-14} {Hits,4} ({Percent:N1}%)", partType, hits, hits * 100.0 / sample.Count);
+
+        Log.Information("Registry rows whose package would not load at all: {Count}", unloadable.Count);
+        foreach (var path in unloadable.Take(20)) Log.Information("  UNLOADABLE {Path}", path);
+
+        Log.Information("Outfits resolving zero parts: {Count}", noParts.Count);
+        foreach (var path in noParts.Take(15)) Log.Information("  ZERO  {Path}", path);
+
+        Log.Information("Outfits with parts but no Body part: {Count}", noBody.Count);
+        foreach (var line in noBody.Take(15)) Log.Information("  NOBODY {Line}", line);
+
+        Log.Information("Parts carrying no SkeletalMesh (export nothing): {Count}", meshless.Count);
+        foreach (var line in meshless.Take(15)) Log.Information("  NOMESH {Line}", line);
+
+        Log.Information("Outfits resolved via the HeroDefinition fallback: {Count}", heroOnly.Count);
+        foreach (var path in heroOnly.Take(15)) Log.Information("  HERO  {Path}", path);
+
+        Log.Information("Audit finished in {Seconds:N1}s", (DateTime.Now - started).TotalSeconds);
+        return noParts.Count == 0 ? 0 : 2;
     }
 
     private static string Describe(byte[] png)

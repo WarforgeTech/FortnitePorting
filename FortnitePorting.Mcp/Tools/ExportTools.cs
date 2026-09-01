@@ -35,13 +35,19 @@ public static class ExportTools
 
     [McpServerTool(Name = "export_assets", Destructive = false, OpenWorld = false)]
     [Description("Exports one or more Fortnite assets (props, outfits, meshes, textures, sounds, ...) to disk. "
-                 + "Meshes land as .uemodel/.psk/.glb next to their PNG/TGA textures. Returns the exact file list written per asset.")]
+                 + "Meshes land as .uemodel/.psk/.glb next to their PNG/TGA textures. Returns the exact file list written per asset, "
+                 + "the style variants applied, and - for outfits/backpacks - the character parts (head, body, hat, ...) that came out.")]
     public static async Task<CallToolResult> ExportAssetsAsync(
         IServiceProvider services,
         [Description("Full object paths to export, e.g. 'FortniteGame/Content/.../PID_Foo.PID_Foo'.")]
         string[] objectPaths,
         [Description("Optional output folder. When set, files land flat in this folder; when omitted they mirror the game path under the configured export root.")]
         string? outputDir = null,
+        [Description("Style variants for cosmetics (outfits, backpacks, pickaxes, ...). Omit for the base look. "
+                     + "Pass the string \"all\" to fold in EVERY option of every channel (what a FortnitePorting folder export does), "
+                     + "or an object selecting one option per channel, e.g. {\"Style\":\"Black & Gold\"}. "
+                     + "Channel and option names are exactly what list_asset_styles reports (matched case- and punctuation-insensitively).")]
+        JsonElement? styles = null,
         [Description("Mesh format: UEFormat (.uemodel, default), ActorX (.psk), or Gltf2 (.glb).")]
         string meshFormat = "UEFormat",
         [Description("Texture format: PNG (default) or TGA.")]
@@ -50,6 +56,8 @@ public static class ExportTools
         string soundFormat = "WAV",
         [Description("Export materials and their textures alongside meshes. Disable for geometry only.")]
         bool exportMaterials = true,
+        [Description("Outfits only: also write the lobby idle montage as a .ueanim (the FortnitePorting 'Import Lobby Poses' option). Off by default.")]
+        bool importLobbyPoses = false,
         CancellationToken cancellationToken = default)
     {
         var loader = services.GetRequiredService<HeadlessLoader>();
@@ -60,6 +68,11 @@ public static class ExportTools
 
         if (!TryParseOptions(outputDir, meshFormat, imageFormat, soundFormat, exportMaterials, out var options, out var optionError))
             return Failure(optionError!);
+
+        if (!TryParseStyles(styles, out var styleSelection, out var styleError))
+            return Failure(styleError!);
+
+        options = options with { Styles = styleSelection, ImportLobbyPoses = importLobbyPoses };
 
         try
         {
@@ -173,7 +186,9 @@ public static class ExportTools
     // ------------------------------------------------------------------ list_asset_styles
 
     [McpServerTool(Name = "list_asset_styles", ReadOnly = true, OpenWorld = false)]
-    [Description("Lists the style channels and options an asset exposes (ItemVariants). For galleries/prefabs it also lists the individual member props.")]
+    [Description("Lists the style channels and options an asset exposes (ItemVariants). The channel and option names it "
+                 + "returns are exactly what export_assets accepts in its `styles` argument. For galleries/prefabs it also "
+                 + "lists the individual member props (export those with export_gallery, not with `styles`).")]
     public static async Task<CallToolResult> ListAssetStylesAsync(
         IServiceProvider services,
         [Description("Full object path of the asset.")] string objectPath,
@@ -197,7 +212,20 @@ public static class ExportTools
             var exportType = CategoryCatalog.DetermineExportType(asset);
             var channels = new JsonArray();
 
-            foreach (var channel in ReadStyleChannels(asset)) channels.Add(channel);
+            // Same resolver the exporter uses, so every option listed here is selectable.
+            var styleChannels = StyleResolver.ReadChannels(asset);
+            foreach (var channel in styleChannels)
+            {
+                channels.Add(new JsonObject
+                {
+                    ["channel"] = channel.Channel,
+                    ["variantType"] = channel.VariantType,
+                    ["multiSelect"] = false,
+                    ["options"] = new JsonArray(channel.Options
+                        .Select(option => (JsonNode) new JsonObject { ["name"] = option.Name })
+                        .ToArray())
+                });
+            }
 
             if (exportType is EExportType.Prefab)
             {
@@ -222,7 +250,12 @@ public static class ExportTools
                 ["assetClass"] = asset.ExportType,
                 ["exportType"] = exportType.ToString(),
                 ["channelCount"] = channels.Count,
-                ["channels"] = channels
+                ["channels"] = channels,
+                ["usage"] = styleChannels.Count == 0
+                    ? "This asset has no style channels; export_assets will export its base look."
+                    : "Pass styles:\"all\" to export_assets for every option at once, or styles:{"
+                      + string.Join(", ", styleChannels.Select(channel => $"\"{channel.Channel}\":\"{channel.Options[0].Name}\""))
+                      + "} to pick one option per channel."
             });
         }
         catch (Exception e)
@@ -308,101 +341,6 @@ public static class ExportTools
         });
     }
 
-    // ------------------------------------------------------------------ style discovery
-
-    /// <summary>Port of AssetInfo's ItemVariants mapping (FortnitePorting/Models/Assets/Asset/AssetInfo.cs).</summary>
-    private static IEnumerable<JsonNode> ReadStyleChannels(UObject asset)
-    {
-        var variants = asset.GetOrDefault("ItemVariants", Array.Empty<UObject>());
-        foreach (var variant in variants)
-        {
-            var channel = TitleCase(variant.GetOrDefault("VariantChannelName", new FText("Style")).Text);
-            var optionsName = variant.ExportType switch
-            {
-                "FortCosmeticCharacterPartVariant" => "PartOptions",
-                "FortCosmeticMaterialVariant" => "MaterialOptions",
-                "FortCosmeticParticleVariant" => "ParticleOptions",
-                "FortCosmeticMeshVariant" => "MeshOptions",
-                "FortCosmeticGameplayTagVariant" => "GenericTagOptions",
-                "FortCosmeticRichColorVariant" => "InlineVariant",
-                "FortCosmeticMaterialParameterSetVariant" => "MaterialParameterSetChoices",
-                "FortCosmeticMorphTargetVariant" => "MorphTargetOptions",
-                "FortCosmeticLoadoutTagDrivenVariant" => "Variants",
-                _ => null
-            };
-
-            if (optionsName is null) continue;
-
-            var options = new JsonArray();
-
-            if (variant.ExportType is "FortCosmeticRichColorVariant" or "FortCosmeticMaterialParameterSetVariant")
-            {
-                foreach (var colorName in ReadColorOptionNames(variant, variant.ExportType is "FortCosmeticMaterialParameterSetVariant"))
-                    options.Add(new JsonObject { ["name"] = colorName });
-            }
-            else
-            {
-                var structs = variant.GetOrDefault<FStructFallback[]>(optionsName, []);
-                foreach (var option in structs)
-                {
-                    if (option.GetOrDefault<FText?>("VariantName") is not { } variantName
-                        || variantName.Text.Equals("Empty", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var optionName = TitleCase(variantName.Text);
-                    options.Add(new JsonObject
-                    {
-                        ["name"] = string.IsNullOrWhiteSpace(optionName) ? "Unnamed" : optionName
-                    });
-                }
-            }
-
-            if (options.Count == 0) continue;
-
-            yield return new JsonObject
-            {
-                ["channel"] = channel,
-                ["variantType"] = variant.ExportType,
-                ["multiSelect"] = false,
-                ["options"] = options
-            };
-        }
-    }
-
-    private static IEnumerable<string> ReadColorOptionNames(UObject variant, bool isParamSet)
-    {
-        var names = new List<string>();
-        try
-        {
-            if (!variant.TryGetValue(out FStructFallback inlineVariant, "InlineVariant")) return names;
-
-            if (isParamSet)
-            {
-                if (!inlineVariant.TryGetValue(out UObject paramSet, "MaterialParameterSetChoices")) return names;
-                if (!paramSet.TryGetValue(out FStructFallback[] choices, "Choices")) return names;
-
-                foreach (var choice in choices)
-                    names.Add(choice.GetOrDefault("DisplayName", new FText("Unnamed")).Text);
-
-                return names;
-            }
-
-            if (!inlineVariant.TryGetValue(out FStructFallback richColorVariant, "RichColorVar")) return names;
-            if (!richColorVariant.TryGetValue(out FSoftObjectPath swatchPath, "ColorSwatchForChoices")) return names;
-            if (!swatchPath.TryLoad(out UObject swatch)) return names;
-            if (!swatch.TryGetValue(out FStructFallback[] colorPairs, "ColorPairs")) return names;
-
-            foreach (var pair in colorPairs)
-                names.Add(pair.GetOrDefault("ColorName", new FName("Unnamed")).PlainText);
-        }
-        catch (Exception e)
-        {
-            Log.Debug("Color style discovery failed: {Message}", e.Message);
-        }
-
-        return names;
-    }
-
     // ------------------------------------------------------------------ plumbing
 
     /// <summary>
@@ -469,6 +407,82 @@ public static class ExportTools
         return true;
     }
 
+    /// <summary>
+    /// Reads the `styles` argument, which is deliberately a union: absent, the string "all", or an
+    /// object of channel -> option. Clients that can only send strings may send the object
+    /// JSON-encoded; that is accepted too.
+    /// </summary>
+    private static bool TryParseStyles(JsonElement? styles, out StyleSelection? selection, out string? error)
+    {
+        selection = null;
+        error = null;
+
+        if (styles is not { } element || element.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            return true;
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+            {
+                var text = (element.GetString() ?? string.Empty).Trim();
+
+                if (text.Length == 0) return true;
+                if (text.Equals("all", StringComparison.OrdinalIgnoreCase))
+                {
+                    selection = StyleSelection.Everything;
+                    return true;
+                }
+
+                if (text.StartsWith('{'))
+                {
+                    try
+                    {
+                        using var document = JsonDocument.Parse(text);
+                        return TryReadStyleObject(document.RootElement, out selection, out error);
+                    }
+                    catch (JsonException e)
+                    {
+                        error = $"`styles` looked like JSON but could not be parsed: {e.Message}";
+                        return false;
+                    }
+                }
+
+                error = $"Unknown `styles` value \"{text}\". Use \"all\", or an object like {{\"Style\":\"Black & Gold\"}}.";
+                return false;
+            }
+
+            case JsonValueKind.Object:
+                return TryReadStyleObject(element, out selection, out error);
+
+            default:
+                error = $"`styles` must be the string \"all\" or an object of channel -> option, not {element.ValueKind}.";
+                return false;
+        }
+    }
+
+    private static bool TryReadStyleObject(JsonElement element, out StyleSelection? selection, out string? error)
+    {
+        selection = null;
+        error = null;
+
+        var byChannel = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var property in element.EnumerateObject())
+        {
+            if (property.Value.ValueKind is not JsonValueKind.String)
+            {
+                error = $"`styles` channel \"{property.Name}\" must map to an option name string, not {property.Value.ValueKind}.";
+                return false;
+            }
+
+            byChannel[property.Name] = property.Value.GetString() ?? string.Empty;
+        }
+
+        if (byChannel.Count == 0) return true;
+
+        selection = new StyleSelection { ByChannel = byChannel };
+        return true;
+    }
+
     private static JsonObject Describe(ExportResult result) => new()
     {
         ["outputRoot"] = result.OutputRoot,
@@ -484,21 +498,48 @@ public static class ExportTools
             }).ToArray())
     };
 
-    private static JsonNode DescribeAsset(ExportedAsset asset) => new JsonObject
+    private static JsonNode DescribeAsset(ExportedAsset asset)
     {
-        ["objectPath"] = asset.ObjectPath,
-        ["displayName"] = asset.DisplayName,
-        ["exportType"] = asset.ExportType,
-        ["outputRoot"] = asset.OutputRoot,
-        ["fileCount"] = asset.Files.Count,
-        ["bytes"] = asset.Bytes,
-        ["files"] = new JsonArray(asset.Files
-            .Select(file => (JsonNode) new JsonObject
-            {
-                ["path"] = file.Path,
-                ["bytes"] = file.Bytes
-            }).ToArray())
-    };
+        var json = new JsonObject
+        {
+            ["objectPath"] = asset.ObjectPath,
+            ["displayName"] = asset.DisplayName,
+            ["exportType"] = asset.ExportType,
+            ["outputRoot"] = asset.OutputRoot,
+            ["fileCount"] = asset.Files.Count,
+            ["bytes"] = asset.Bytes,
+            ["files"] = new JsonArray(asset.Files
+                .Select(file => (JsonNode) new JsonObject
+                {
+                    ["path"] = file.Path,
+                    ["bytes"] = file.Bytes
+                }).ToArray())
+        };
+
+        if (asset.AppliedStyles.Count > 0)
+            json["appliedStyles"] = ToolResults.ToJsonArray(asset.AppliedStyles);
+
+        if (asset.Notes.Count > 0)
+            json["notes"] = ToolResults.ToJsonArray(asset.Notes);
+
+        if (asset.Parts.Count > 0)
+        {
+            json["partCount"] = asset.Parts.Count;
+            json["parts"] = new JsonArray(asset.Parts
+                .Select(part => (JsonNode) new JsonObject
+                {
+                    ["name"] = part.Name,
+                    ["partType"] = part.PartType,
+                    ["gender"] = part.Gender,
+                    ["fromStyle"] = part.IsOverride,
+                    ["poseAsset"] = part.PoseAsset,
+                    ["materials"] = part.MaterialCount,
+                    ["overrideMaterials"] = part.OverrideMaterialCount
+                }).ToArray());
+        }
+
+        return json;
+    }
 
     /// <summary>"Not ready" is a retryable status, not an error - see WIRING.md §7c.</summary>
     private static async Task<CallToolResult?> NotReady(HeadlessLoader loader, CancellationToken token)
@@ -557,11 +598,4 @@ public static class ExportTools
         return System.Text.Encoding.UTF8.GetString(bytes, 0, count);
     }
 
-    private static string TitleCase(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return value;
-
-        var parts = value.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return string.Join(' ', parts.Select(part => char.ToUpperInvariant(part[0]) + part[1..]));
-    }
 }

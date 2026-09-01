@@ -357,12 +357,20 @@ public static class DiscoveryTools
         // Rarity / series / set --------------------------------------------------
         if (entry is null || !entry.HideRarity)
         {
-            var rarity = SafeRarity(asset);
-            if (rarity is not null) payload["rarity"] = rarity;
+            if (SafeRarity(asset) is { } rarity)
+            {
+                // EFortRarity's tokens are internal aliases (Quality == Epic, Fine == Legendary,
+                // Sturdy == Rare, ...). Report the player-facing name and keep the raw token beside it.
+                payload["rarity"] = rarity.GetNameText().Text;
+                payload["rarityRaw"] = rarity.ToString();
+            }
         }
 
         payload["series"] = SafeSeries(asset);
         payload["set"] = SafeSet(loader, entry, asset);
+
+        var season = SafeIntroducedSeason(entry, asset);
+        if (season is not null) payload["introducedSeason"] = season;
 
         // Icon textures ----------------------------------------------------------
         var icons = new JsonArray();
@@ -373,6 +381,9 @@ public static class DiscoveryTools
 
         // Style variants ---------------------------------------------------------
         payload["styleVariants"] = ReadStyleVariants(asset);
+
+        // Character parts (outfits, backpacks, pets, companions) -----------------
+        AddCharacterParts(payload, asset);
 
         return ToolResults.Structured(payload);
     }
@@ -560,20 +571,20 @@ public static class DiscoveryTools
         catch { return EExportType.None; }
     }
 
-    private static string? SafeRarity(UObject asset)
+    private static EFortRarity? SafeRarity(UObject asset)
     {
         try
         {
             if (asset.GetDataListItem<FName?>("Rarity") is { } dataListName &&
                 Enum.TryParse<EFortRarity>(dataListName.Text.SubstringAfter("::"), out var dataListRarity))
-                return dataListRarity.ToString();
+                return dataListRarity;
         }
         catch { /* optional */ }
 
         try
         {
             if (asset.Properties.Any(property => property.Name.Text.Equals("Rarity", StringComparison.Ordinal)))
-                return asset.GetOrDefault("Rarity", EFortRarity.Uncommon).ToString();
+                return asset.GetOrDefault("Rarity", EFortRarity.Uncommon);
         }
         catch { /* optional */ }
 
@@ -641,39 +652,23 @@ public static class DiscoveryTools
         });
     }
 
+    /// <summary>
+    /// Backed by the same <see cref="StyleResolver"/> the exporter uses, so the channel and option
+    /// names reported here are exactly what export_assets accepts in `styles`.
+    /// </summary>
     private static JsonArray ReadStyleVariants(UObject asset)
     {
         var variants = new JsonArray();
         try
         {
-            foreach (var variant in asset.GetOrDefault("ItemVariants", Array.Empty<UObject>()))
+            foreach (var channel in StyleResolver.ReadChannels(asset))
             {
-                if (variant is null) continue;
-
-                var optionsName = variant.ExportType switch
-                {
-                    "FortCosmeticCharacterPartVariant" => "PartOptions",
-                    "FortCosmeticMaterialVariant" => "MaterialOptions",
-                    "FortCosmeticParticleVariant" => "ParticleOptions",
-                    "FortCosmeticMeshVariant" => "MeshOptions",
-                    "FortCosmeticGameplayTagVariant" => "GenericTagOptions",
-                    "FortCosmeticMorphTargetVariant" => "MorphTargetOptions",
-                    "FortCosmeticLoadoutTagDrivenVariant" => "Variants",
-                    _ => null
-                };
-
-                var optionCount = 0;
-                if (optionsName is not null)
-                {
-                    try { optionCount = variant.GetOrDefault(optionsName, Array.Empty<global::CUE4Parse.UE4.Assets.Objects.FStructFallback>()).Length; }
-                    catch { optionCount = 0; }
-                }
-
                 variants.Add(new JsonObject
                 {
-                    ["channel"] = variant.GetOrDefault("VariantChannelName", new global::CUE4Parse.UE4.Objects.Core.i18N.FText("Style")).Text,
-                    ["variantType"] = variant.ExportType,
-                    ["optionCount"] = optionCount
+                    ["channel"] = channel.Channel,
+                    ["variantType"] = channel.VariantType,
+                    ["optionCount"] = channel.Options.Count,
+                    ["options"] = ToolResults.ToJsonArray(channel.Options.Select(option => option.Name))
                 });
             }
         }
@@ -683,6 +678,89 @@ public static class DiscoveryTools
         }
 
         return variants;
+    }
+
+    /// <summary>
+    /// Character parts an outfit/backpack is built from, resolved the way the exporter resolves them
+    /// (BaseCharacterParts, else the HeroDefinition specialization fallback). Surfaces body type /
+    /// gender and flags any part that carries no mesh - the one case where an export comes out short.
+    /// </summary>
+    private static void AddCharacterParts(JsonObject payload, UObject asset)
+    {
+        CharacterPartSet set;
+        try { set = CharacterPartInspector.Read(asset); }
+        catch (Exception e)
+        {
+            Log.Debug("Character-part read failed for {Name}: {Message}", asset.Name, e.Message);
+            return;
+        }
+
+        if (set.Parts.Count == 0 && !set.HasHeroDefinition) return;
+
+        var parts = new JsonArray();
+        foreach (var part in set.Parts)
+        {
+            parts.Add(new JsonObject
+            {
+                ["name"] = part.Name,
+                ["partType"] = part.PartType,
+                ["gender"] = part.Gender,
+                ["objectPath"] = part.ObjectPath,
+                ["skeletalMesh"] = part.SkeletalMesh,
+                ["additionalData"] = part.AdditionalData
+            });
+        }
+
+        payload["characterParts"] = new JsonObject
+        {
+            ["source"] = set.Source,
+            ["hasHeroDefinition"] = set.HasHeroDefinition,
+            ["partCount"] = set.Parts.Count,
+            ["partTypes"] = ToolResults.ToJsonArray(set.PartTypes),
+            ["bodyType"] = set.BodyGender,
+            ["partsWithoutMesh"] = set.MeshlessParts.Count(),
+            ["parts"] = parts
+        };
+    }
+
+    /// <summary>
+    /// Season a cosmetic was introduced in. Fortnite carries this as the gameplay tag
+    /// <c>Cosmetics.Filter.Season.N</c>; a few definitions also expose a plain <c>Season</c> int.
+    /// </summary>
+    private static JsonNode? SafeIntroducedSeason(AssetCategoryEntry? entry, UObject asset)
+    {
+        try
+        {
+            var tags = (entry ?? DefaultEntry).GameplayTagHandler(asset);
+            var seasonTag = tags?.GameplayTags?
+                .Select(tag => tag.TagName.Text)
+                .FirstOrDefault(text => text.StartsWith("Cosmetics.Filter.Season.", StringComparison.OrdinalIgnoreCase));
+
+            if (seasonTag is not null)
+            {
+                var value = seasonTag.SubstringAfterLast('.');
+                return new JsonObject
+                {
+                    ["season"] = int.TryParse(value, out var number) ? number : null,
+                    ["raw"] = value,
+                    ["source"] = seasonTag
+                };
+            }
+        }
+        catch { /* optional */ }
+
+        try
+        {
+            if (asset.Properties.Any(property => property.Name.Text.Equals("Season", StringComparison.Ordinal)))
+                return new JsonObject
+                {
+                    ["season"] = asset.GetOrDefault("Season", 0),
+                    ["source"] = "Season property"
+                };
+        }
+        catch { /* optional */ }
+
+        return null;
     }
 }
 

@@ -28,8 +28,21 @@ public record ExportOptions
     public ESoundFormat SoundFormat { get; init; } = ESoundFormat.WAV;
     public bool ExportMaterials { get; init; } = true;
 
+    /// <summary>
+    /// Outfits only: also export the lobby idle montage as a .ueanim (the GUI's "Import Lobby Poses"
+    /// toggle). Off by default, exactly as in the GUI.
+    /// </summary>
+    public bool ImportLobbyPoses { get; init; }
+
     /// <summary>Override for the export type; when None the catalog decides.</summary>
     public EExportType ForceExportType { get; init; } = EExportType.None;
+
+    /// <summary>
+    /// Style variants to apply. Null (the default) exports the base look, which is what the GUI does
+    /// for an asset with nothing selected. <see cref="StyleSelection.Everything"/> mirrors a GUI
+    /// folder export (AssetInfo.GetAllStyles).
+    /// </summary>
+    public StyleSelection? Styles { get; init; }
 }
 
 public record ExportedFile(string Path, long Bytes);
@@ -41,8 +54,21 @@ public record ExportedAsset
     public required string ExportType { get; init; }
     public required string OutputRoot { get; init; }
     public List<ExportedFile> Files { get; init; } = [];
+
+    /// <summary>"Channel: Option" for every style variant that was folded into this export.</summary>
+    public List<string> AppliedStyles { get; init; } = [];
+
+    /// <summary>Character parts the exporter produced, for outfit/backpack completeness checks.</summary>
+    public List<ExportedPart> Parts { get; init; } = [];
+
+    /// <summary>Caller-facing warnings about work the exporter attempted but could not finish.</summary>
+    public List<string> Notes { get; init; } = [];
+
     public long Bytes => Files.Sum(file => file.Bytes);
 }
+
+/// <summary>One character part (head, body, hat, backpack, ...) that landed in a mesh export.</summary>
+public record ExportedPart(string Name, string PartType, string Gender, bool IsOverride, string? PoseAsset, int MaterialCount, int OverrideMaterialCount);
 
 public record ExportFailure(string ObjectPath, string Error);
 
@@ -351,6 +377,15 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
         var outputRoot = ResolveRoot(opts.OutputDir);
         var displayName = DisplayNameOf(asset) ?? asset.Name;
 
+        // Style resolution happens before the gate so a bad selection fails fast and cheaply.
+        var styles = Array.Empty<ExportStyleBase>();
+        var appliedStyles = new List<string>();
+        if (opts.Styles is { IsEmpty: false } selection)
+        {
+            if (!StyleResolver.TryResolve(asset, selection, out styles, out appliedStyles, out var styleError))
+                return new SingleExport(null, new ExportFailure(requestedPath, styleError!));
+        }
+
         await _exportGate.WaitAsync(token);
         try
         {
@@ -363,7 +398,7 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             BaseExport export;
             try
             {
-                export = session.CreateExport(displayName, asset, exportType, Array.Empty<ExportStyleBase>());
+                export = session.CreateExport(displayName, asset, exportType, styles);
             }
             catch (Exception e)
             {
@@ -394,7 +429,10 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 DisplayName = displayName,
                 ExportType = exportType.ToString(),
                 OutputRoot = outputRoot,
-                Files = files
+                Files = files,
+                AppliedStyles = appliedStyles,
+                Parts = DescribeParts(export),
+                Notes = CollectNotes(export, files)
             }, null);
         }
         catch (Exception e)
@@ -418,7 +456,8 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             MeshFormat = opts.MeshFormat,
             ImageFormat = opts.ImageFormat,
             SoundFormat = opts.SoundFormat,
-            ExportMaterials = opts.ExportMaterials
+            ExportMaterials = opts.ExportMaterials,
+            ImportLobbyPoses = opts.ImportLobbyPoses
         }
     };
 
@@ -540,17 +579,46 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
 
         var imageExtension = meta.Settings.ImageFormat is EImageFormat.TGA ? "tga" : "png";
 
+        IEnumerable<string> TexturesOf(ParameterCollection parameters)
+            => parameters.Textures
+                .Where(texture => !string.IsNullOrEmpty(texture.Texture.Path))
+                .Select(texture => ToDiskPath(texture.Texture.Path, imageExtension, meta));
+
         foreach (var exportMesh in EnumerateMeshes(mesh))
         {
             if (!string.IsNullOrEmpty(exportMesh.Path))
                 yield return ToDiskPath(exportMesh.Path, meshExtension, meta);
 
             foreach (var material in exportMesh.Materials.Concat(exportMesh.OverrideMaterials))
-            foreach (var texture in material.Textures)
-            {
-                if (string.IsNullOrEmpty(texture.Texture.Path)) continue;
-                yield return ToDiskPath(texture.Texture.Path, imageExtension, meta);
-            }
+            foreach (var path in TexturesOf(material))
+                yield return path;
+
+            // Head parts carry a facial .uepose; body parts can carry a master skeleton mesh.
+            if (exportMesh is not ExportPart part) continue;
+
+            if (part.Meta is ExportPoseAssetMeta { PoseAsset: { Length: > 0 } poseAsset })
+                yield return ToDiskPath(poseAsset, "uepose", meta);
+
+            if (part.Meta is ExportMasterSkeletonMeta { MasterSkeletalMesh.Path: { Length: > 0 } masterPath })
+                yield return ToDiskPath(masterPath, meshExtension, meta);
+        }
+
+        // Style overrides live beside the meshes, not inside them.
+        foreach (var overrideMaterial in mesh.OverrideMaterials)
+        foreach (var path in TexturesOf(overrideMaterial.Material))
+            yield return path;
+
+        foreach (var overrideParameters in mesh.OverrideParameters)
+        foreach (var path in TexturesOf(overrideParameters))
+            yield return path;
+
+        if (mesh.Animation is { } animation)
+        {
+            if (animation.Skeleton?.Path is { Length: > 0 } skeletonPath)
+                yield return ToDiskPath(skeletonPath, meshExtension, meta);
+
+            foreach (var section in animation.Sections.Where(section => !string.IsNullOrEmpty(section.Path)))
+                yield return ToDiskPath(section.Path, "ueanim", meta);
         }
     }
 
@@ -563,7 +631,66 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             yield return current;
 
             foreach (var child in current.Children) queue.Enqueue(child);
+
+            if (current is ExportPart { Meta: ExportMasterSkeletonMeta { MasterSkeletalMesh: { } master } })
+                queue.Enqueue(master);
         }
+    }
+
+    /// <summary>
+    /// Turns silent exporter shortfalls into something the caller can read. Animation conversion is
+    /// the one that bites: Fortnite's sequences are ACL-compressed and the converter needs the native
+    /// CUE4Parse-Natives library. When it is absent the exporter logs a warning and carries on, so
+    /// without this note an animation-bearing export would report success with no animation file.
+    /// </summary>
+    private static List<string> CollectNotes(BaseExport export, List<ExportedFile> files)
+    {
+        var notes = new List<string>();
+        if (export is not MeshExport { Animation: { } animation } || animation.Sections.Count == 0) return notes;
+
+        var wroteAnimation = files.Any(file =>
+            file.Path.EndsWith(".ueanim", StringComparison.OrdinalIgnoreCase) ||
+            file.Path.EndsWith(".psa", StringComparison.OrdinalIgnoreCase));
+
+        if (!wroteAnimation)
+            notes.Add($"The lobby idle montage \"{animation.Name}\" was resolved but produced no animation file. "
+                      + "Fortnite animations are ACL-compressed and need the native CUE4Parse-Natives library, which is "
+                      + "not available in this build. Meshes and textures are unaffected.");
+
+        return notes;
+    }
+
+    /// <summary>
+    /// Flattens the character parts a mesh export produced. Base parts come from
+    /// <c>MeshExport.Meshes</c>, style-swapped parts from <c>OverrideMeshes</c>; both are reported so
+    /// a caller can see that e.g. a head + body + hat all made it out.
+    /// </summary>
+    private static List<ExportedPart> DescribeParts(BaseExport export)
+    {
+        var parts = new List<ExportedPart>();
+        if (export is not MeshExport mesh) return parts;
+
+        var overridePaths = new HashSet<string>(
+            mesh.OverrideMeshes.Select(item => item.Path).Where(path => !string.IsNullOrEmpty(path)),
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var exportMesh in EnumerateMeshes(mesh))
+        {
+            if (exportMesh is not ExportPart part) continue;
+
+            var poseAsset = part.Meta is ExportPoseAssetMeta { PoseAsset: { Length: > 0 } pose } ? pose : null;
+
+            parts.Add(new ExportedPart(
+                part.Name,
+                part.Type.ToString(),
+                part.GenderPermitted.ToString(),
+                !string.IsNullOrEmpty(part.Path) && overridePaths.Contains(part.Path),
+                poseAsset,
+                part.Materials.Count,
+                part.OverrideMaterials.Count));
+        }
+
+        return parts;
     }
 
     private static string ToDiskPath(string objectPath, string extension, ExportDataMeta meta)

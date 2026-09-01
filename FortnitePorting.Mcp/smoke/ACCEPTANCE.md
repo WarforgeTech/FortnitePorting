@@ -91,3 +91,86 @@ Disk cache 17.4 MB for Prop, ≈19 MB total.
 * A search issued during the first ~9 s of a cold run can still report partial display-name coverage; the reply
   says so and names the category. Warm runs load every category off disk inside the 3 s grace.
 * Fix 2 (`shareTextures`) and fix 4 (style-variant export) remain queued.
+
+---
+
+# Outfits deep pass (2026-08-31, third round)
+
+Closes queued fix **4** (style-variant export) and takes Outfits to production grade.
+Server rebuilt and re-published to `publish\mcp\FortnitePorting.Mcp.exe`; all evidence below comes from that build,
+driven through `--call` (the same dispatch path the MCP server uses).
+
+## What changed
+
+* **New `Core/StyleResolver.cs`** — headless port of the GUI's whole style pipeline
+  (`AssetInfo` ctor + `AssetStyleInfo` + `ExportService.ConvertStyles`). Reads `ItemVariants` into channels of named
+  options and maps each option onto the `ExportStyleBase` the exporter wants: `ExportStructStyle` for part/material/
+  mesh/particle/tag/morph variants, `ExportColorStyle` for `FortCosmeticRichColorVariant` (StyleData = `RichColorVar`,
+  ColorData = the `ColorPairs` entry) and for `FortCosmeticMaterialParameterSetVariant` (StyleData = `InlineVariant`,
+  ColorData = the choice, `IsParamSet = true`), plus the GUI's synthetic **"Universal"** empty-struct option for
+  `FortCosmeticLoadoutTagDrivenVariant`. Selecting every option of every channel is exactly `AssetInfo.GetAllStyles()`,
+  i.e. what a GUI folder export does.
+* **`export_assets` gained `styles`** — omitted = base look (unchanged behaviour); `"all"` = every option of every
+  channel; or an object of channel to option, e.g. `{"Style":"Black & Gold"}`. Names are matched case- and
+  punctuation-insensitively (`{"style":"black and gold"}` resolves). The resolved array goes straight into
+  `ExportSession.CreateExport(displayName, asset, exportType, styles)`. Applies to every cosmetic that carries
+  `ItemVariants` — outfits, backpacks, pickaxes — because they share the one `MeshExport.ExportStyles` mechanism.
+  A bad channel/option fails that asset with a message listing the valid names, before any work is done.
+* **`export_assets` gained `importLobbyPoses`** (default false, matching the GUI toggle).
+* **`export_assets` now reports** `appliedStyles`, a `parts[]` block (name / partType / gender / fromStyle /
+  poseAsset / material counts) and `notes[]`.
+* **`list_asset_styles` and `get_asset_info.styleVariants` are now backed by the same resolver as the exporter**, so
+  every option they list is selectable verbatim. `list_asset_styles` also returns a `usage` line showing the exact
+  `styles` argument to pass. The two code paths were previously separate ports and had drifted — the old param-set
+  reader listed choices the GUI skips.
+* **`ExportRunner.ResolveModelPaths` widened** to cover style override materials/parameters, head `.uepose` pose
+  assets, body master-skeleton meshes and animation sections. These were previously only caught by the filesystem
+  diff, so a re-export into a folder that already held the output under-reported them.
+* **New `Core/CharacterPartInspector.cs`** — resolves an outfit's parts in `MeshExport`'s exact order
+  (`BaseCharacterParts`, else `HeroDefinition.Specializations[0].CharacterParts`, else the flat `CharacterParts` used
+  by backpacks/pets). Feeds a new `characterParts` block in `get_asset_info`: source, part types, **bodyType**,
+  per-part mesh and `AdditionalData`, and a `partsWithoutMesh` count.
+* **`get_asset_info` rarity fixed and enriched** — `EFortRarity`'s tokens are internal aliases
+  (`Quality == Epic`, `Fine == Legendary`, `Sturdy == Rare`) and `.ToString()` was returning the alias. `rarity` is
+  now the player-facing name with `rarityRaw` beside it. Added `introducedSeason` from the
+  `Cosmetics.Filter.Season.N` gameplay tag.
+* **New `--outfitaudit N [--category X] [--seed S]` CLI mode**, and `--iconcoverage` now names its misses.
+
+## Verification
+
+| # | Check | Result | Evidence |
+|---|---|---|---|
+| o1 | Renegade Raider style export produces materially different output | PASS | `CID_028_Athena_Commando_F`, flat output dirs. base **30 files / 1,355,389 B**; `{"Style":"Black & Gold"}` **42 files / 1,410,080 B**; `"all"` **46 files / 1,432,228 B**. The 12 files unique to Black & Gold are the override texture set `T_RenegadeRaider_Onyx_{Body,FaceAcc}_{D,E,FX,M,N,S}` plus `T_Fuzz_MASK.png`; `"all"` adds 4 more (`F_MED_Commando_TV21_{d,m,n,s}` = the Checkered variant). The 30 base files are byte-identical across all three runs. |
+| o2 | Loose name matching | PASS | `{"style":"black and gold"}` gives `appliedStyles:["Style: Black & Gold"]` and the same 42 files / 1,410,080 B. |
+| o3 | Style export works for other cosmetic categories | PASS | Backpack `BID_479_CatBurglar` ("Gold Dagger Pack", 4 options): base **6** files; `{"Style":"Shadow"}` **7** (adds `T_CatBurglar_GoodDark_Backpack_D.png`); `"all"` **9** (adds `T_M_MED_CatBurglar_Good_Backpack_{D,S}.png`). Pickaxes run the same code path; the ones sampled (`HalloweenScythe`) carry no `ItemVariants` and say so. |
+| o4 | `list_asset_styles` and `export_assets` agree | PASS | `list_asset_styles` on CID_028 returns channel `"Style"` with options `Default / Checkered / Black & Gold` and a `usage` string; all three names are accepted verbatim by `export_assets`. |
+| o5 | Bad style selections fail loudly, not silently | PASS | Unknown option: `Channel "Style" of 'CID_028_Athena_Commando_F' has no option named "Neon Purple". Available options: "Default", "Checkered", "Black & Gold".` Unknown channel lists `"Style"`. Styleless asset with `styles:"all"` tells the caller to omit `styles`. `styles:"everything"` is rejected with the two valid forms. All are per-asset `failures[]` with `isError=false` for the batch. |
+| o6 | Part completeness, 3 diverse outfits | PASS | **CID_028 Renegade Raider** (classic CID, female): 3 parts Body+Head+Hat, `.uepose` facial pose, master skeleton `SK_M_Female_Base_Skeleton.uemodel`, 30 files. **CID_694 Midas** (Head/Body/Face/Hat): 4 parts, 29 files = 23 png + 5 uemodel + 1 uepose. **Character_FearlessFlightHero, Spider-Man (Miles Morales)** (modern `Character_*`): 3 parts Head/Body/Face, 15 files = 11 png + 4 uemodel. Nothing `get_asset_info` listed was missing from any of the three exports. |
+| o7 | Part completeness at scale | PASS | `--outfitaudit 1200 --seed 77` = **1,017 unique outfits**. 942 resolve via `BaseCharacterParts`; **every one of those has both a Head and a Body part** (0 missing-body). Face 69.3%, Hat 10.4%, MiscOrTail 2.9%, Backpack 0.2%. Only **8 parts out of roughly 2,800** carry no `SkeletalMesh`, and their names show them to be deliberate no-ops or dev stubs (`NoBackpack`, `NoFaceAccessory`, `CID_BentBaton_Temp`, two `_FaceAcc` entries). 1-2 outfits resolve zero parts (`Character_NPCHireReward`, an NPC-hire reward stub). |
+| o8 | Outfit icon coverage: what is the missing 9%? | EXPLAINED, no fix possible | `--iconcoverage 150 --category Outfit` with the cache cleared: **139/150 = 92.7% handler, 11 placeholder**. All 11 misses are Save-the-World hero cosmetics under `/SaveTheWorld/Heroes/{Commando,Constructor,Ninja,Outlander}/CosmeticCharacterItemDefinitions/`. `--outfitaudit` on the same seed shows those same 11 rows are **unloadable**, and `search_files {"query":"CID_Constructor_022"}` returns **0 files**: the packages are listed in the asset registry but are not shipped in this BR-only install. No IconResolver fallback can reach them. At the larger sample, 73 of 1,017 sampled Outfit rows (7.2%) are these STW ghosts. **Real-icon coverage over loadable BR outfits is 139/139 = 100%.** |
+| o9 | `get_asset_info` metadata, 5 well-known skins plus a Series one | PASS | Drift `Legendary` (raw `Fine`) / set Drift / S5 / 2 parts / Style(6). Midas `Legendary` (raw `Fine`) / Golden Ghost / S12 / 4 parts / Style(4). Peely `Epic` (raw `Quality`) / Banana Bunch / S8 / 3 parts. Raven `Legendary` / Nevermore / S3 / 2 parts. Renegade Raider `Rare` (raw `Sturdy`) / Storm Scavenger / S1 / 3 parts / Style(3). Spider-Man (Miles Morales) `Epic` / **series MarvelSeries "MARVEL SERIES"** / set "Across the Spider-Verse" / S24 / 3 parts / Style(2). All match known Fortnite data. |
+| o10 | Rebuild / self-test / tool schema | PASS | `dotnet build -c Release`: 0 errors, 0 CS warnings. `--selftest` PASSED in 4.6 s (569,456 registry entries, 12 tools, icon decoded 21,295 B). `--tools` shows `styles` on `export_assets` as an untyped union property carrying the usage text. stdout purity untouched: no new Console writes, Serilog still stderr-only. |
+
+## Findings that are environment, not code
+
+* **Animation export is dead in this build.** `importLobbyPoses:true` on Midas resolves the montage
+  `CatBurglar_Male_Idle` and exports its skeleton and lobby props, but the `.ueanim` fails with
+  `DllNotFoundException: CUE4Parse-Natives` — Fortnite animations are ACL-compressed and need the native library,
+  which this machine cannot build (`cmake` is not on PATH; the build logs `CUE4Parse-Natives build failed. Continuing
+  without it`). The exporter swallows that as a warning, so without help an export would report success with no
+  animation file. `export_assets` now returns an explicit `notes[]` entry saying exactly this. Meshes, textures and
+  `.uepose` pose assets are unaffected. Emote and animation exports share the limitation.
+
+## Left imperfect
+
+* **No outfit in this archive uses the `HeroDefinition.Specializations` fallback** — 0 of 1,017 sampled. The code
+  path is implemented and mirrors `MeshExport` exactly, but it could not be exercised against real data here: the
+  assets that would use it are the Save-the-World hero definitions, whose packages are not shipped in this install
+  (see o8). Recorded as untested rather than verified.
+* `styles:"all"` deliberately does **not** include a Prefab's "Individual Props" object styles — `export_gallery`
+  owns that path and does it better (one folder per prop). `list_asset_styles` still lists them for discovery.
+* Style overrides land in the same flat output folder as the base look. Which texture belongs to which style is
+  readable from the file names and from `appliedStyles`, but there is no per-style subfolder.
+* The stdio JSON-RPC harness referenced in the earlier rounds is not checked into this repo, so this round was
+  verified through `--call` (identical dispatch) and `--tools` rather than over the wire.
+* Fix 2 (`shareTextures`) remains queued.
