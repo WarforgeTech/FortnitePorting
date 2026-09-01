@@ -1,15 +1,349 @@
 {
-  "comment": "Hand-maintained. An entry belongs here ONLY after somebody drove the stock UEFN editor MCP against that mount and watched the result. 'verified' verbs: find = find_assets(folder_path) returned rows; capture = CaptureAssetImage rendered an image; place = add_to_scene_from_asset spawned an actor; resolve = a PPID placement auto-resolved to its creative prop BP. A mount absent from this file is reported unverified, which is the honest default - the dump can prove a path exists in the archive, never that UEFN will accept it.",
+  "comment": "Hand-maintained plus swept. An entry belongs here ONLY after somebody drove the stock UEFN editor MCP against that mount and watched the result. 'status': verified = the editor answered for this path; missing = find_assets returned nothing, so the mount is not exposed in the content browser at all. 'verified' verbs: find = find_assets(folder_path) returned rows; capture = CaptureAssetImage rendered a TEXTURED image (a grey render is recorded as find-only with a note); place = add_to_scene_from_asset spawned an actor; resolve = a PPID placement auto-resolved to its creative prop BP. A mount absent from this file is reported unverified, which is the honest default - the dump can prove a path exists in the archive, never that UEFN will accept it.",
   "mounts": [
     {
-      "uefnPath": "/Game/Environments",
-      "verified": ["find", "capture", "place"],
-      "note": "find_assets(folder_path='/Game/Environments', name='JuniperHedge') returned rows; CaptureAssetImage rendered the SM; add_to_scene_from_asset on the SM package path placed a FortStaticMeshActor."
+      "uefnPath": "/AlleyT_Comp",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; preview quality unconfirmed - CaptureAssetImage on /Game/Environments/Artemis/Sets/StripMall/Props/Meshes/SM_StripMall_Awning_02 returned an untextured (grey) render, which may be an unloaded-material artefact rather than a bad asset."
+    },
+    {
+      "uefnPath": "/BeachT_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Playgrounds/Items/Props/Yacht_Spotlight_Can."
+    },
+    {
+      "uefnPath": "/BeanstalkLevelArt",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/BeanstalkLevel_Composition",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; preview quality unconfirmed - CaptureAssetImage on /BeanstalkLevelArt/Environments/S01/ModularKit/Meshes/Openings/Rect/SM_BS_S01_Archway_Rect_Mid_1s_A returned an untextured (grey) render, which may be an unloaded-material artefact rather than a bad asset."
     },
     {
       "uefnPath": "/Burd_Comp",
-      "verified": ["resolve", "place"],
+      "status": "verified",
+      "verified": [
+        "resolve",
+        "place"
+      ],
       "note": "add_to_scene_from_asset on the PPID full object path (/Burd_Comp/SetupAssets/Maps/PPIDs/PPID_X.PPID_X) placed and auto-resolved to the creative prop BP actor. CaptureAssetImage on a PPID does NOT work."
+    },
+    {
+      "uefnPath": "/CRG_Props",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; preview quality unconfirmed - CaptureAssetImage on /Game/Environments/Apollo/Sets/Floating_Dwellings/Meshes/Flotation_OutsideCorner returned an untextured (grey) render, which may be an unloaded-material artefact rather than a bad asset."
+    },
+    {
+      "uefnPath": "/CRP_Jungle",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Asteria/Props/Coastal/Coastal_Canoe_A/Meshes/SM_Coastal_Canoe_A."
+    },
+    {
+      "uefnPath": "/CRP_NeonCity",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 3 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Agency/Meshes/Agency_Railing_Full_C."
+    },
+    {
+      "uefnPath": "/CR_Legacy",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Sets/ArtDeco/Architecture/Export/S_AD_Balcony_I_Rail_01."
+    },
+    {
+      "uefnPath": "/Canyon_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Agency/Props/Meshes/S_Agency_Chair_01."
+    },
+    {
+      "uefnPath": "/City_Comp",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/ClawsyL_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Asteria/Props/AmberForestTown/AmberForestTown_Rug_A/Meshes/SM_AmberForestTown_Rug_CP."
+    },
+    {
+      "uefnPath": "/DarkV_Meadow_Comp",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/DelMarGame",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 2 row(s)."
+    },
+    {
+      "uefnPath": "/Desert_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Artemis/Props/Commerce/Commerce_StanchionRope_A/Meshes/SM_Commerce_StanchionRope_A."
+    },
+    {
+      "uefnPath": "/Drome_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/MountainBase/Props/Meshes/S_MountainBase_Poster_01."
+    },
+    {
+      "uefnPath": "/Dvoyager_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Street/Props/Meshes/SM_Street_BasketballHoop_01."
+    },
+    {
+      "uefnPath": "/FNEC_Nature_Ch5_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Foliage/BigBush/Meshes/BigBushShadowProxy."
+    },
+    {
+      "uefnPath": "/FNSpaceIngestion",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/Game/Athena",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 2 row(s)."
+    },
+    {
+      "uefnPath": "/Game/Building",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/Game/Creative",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/Game/Environments",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture",
+        "place"
+      ],
+      "note": "find_assets(folder_path='/Game/Environments', name='JuniperHedge') returned rows; CaptureAssetImage rendered the SM; add_to_scene_from_asset on the SM package path placed a FortStaticMeshActor."
+    },
+    {
+      "uefnPath": "/Game/Packages",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 2 row(s)."
+    },
+    {
+      "uefnPath": "/Game/Playgrounds",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/Harbor_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/MountainBase/Props/Meshes/S_MountainBase_Light_03."
+    },
+    {
+      "uefnPath": "/Hera",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/Hermes",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; capture not attempted in the sweep. find_assets returned 1 row(s)."
+    },
+    {
+      "uefnPath": "/Jethro",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/LACity_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Agency/Props/Meshes/SM_Agency_Midas_chair-guest_01."
+    },
+    {
+      "uefnPath": "/MaskedT_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Rocks/Natural_Rocks/Meshes/SM_Apollo_Natural_Rock_Pile_B."
+    },
+    {
+      "uefnPath": "/OXR_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Helios/Props/Recreation/Recreation_PingPongTable_A/Meshes/SM_Recreation_PingPongTable_A."
+    },
+    {
+      "uefnPath": "/RRails_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Hightower_SLC/Props/Meshes/S_HighTower_SLC_WorkBench_01."
+    },
+    {
+      "uefnPath": "/SW_A_Comp",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/SevenB_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Coastal/Props/Meshes/S_Coastal_Clutter_06."
+    },
+    {
+      "uefnPath": "/Squibbly_Comp",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; preview quality unconfirmed - CaptureAssetImage on /Game/Environments/Apollo/Sets/BeachyBluffs/Meshes/Fishstick_Signage1 returned an untextured (grey) render, which may be an unloaded-material artefact rather than a bad asset."
+    },
+    {
+      "uefnPath": "/Suburban_Assets",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/Suburban_Composition",
+      "status": "missing",
+      "verified": [],
+      "note": "find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope."
+    },
+    {
+      "uefnPath": "/SuperS_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/Fortnitemare/Props/Meshes/S_FNMR_Inflatable_02."
+    },
+    {
+      "uefnPath": "/TTides_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Apollo/Sets/MountainBase/Props/Meshes/S_MountainBase_HoloTable_01."
+    },
+    {
+      "uefnPath": "/Temples_Comp",
+      "status": "verified",
+      "verified": [
+        "find",
+        "capture"
+      ],
+      "note": "find_assets returned 1 row(s); CaptureAssetImage rendered a textured preview of /Game/Environments/Asteria/Props/Dojo/Dojo_Samurai_Armor_A/Meshes/SM_Dojo_Samurai_Armor_A."
+    },
+    {
+      "uefnPath": "/Utopia_Comp",
+      "status": "verified",
+      "verified": [
+        "find"
+      ],
+      "note": "search-verified; preview quality unconfirmed - CaptureAssetImage on /Game/Environments/Asteria/Props/NeonCity/NeonCity_Desks_Cabinet_A/Meshes/SM_NeonCity_Desks_Cabinet_A returned an untextured (grey) render, which may be an unloaded-material artefact rather than a bad asset."
     }
   ]
 }

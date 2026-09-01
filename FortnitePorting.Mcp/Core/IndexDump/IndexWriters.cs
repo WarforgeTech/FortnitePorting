@@ -77,6 +77,25 @@ public sealed record ScopeRow
     public required string SampleAssetName { get; init; }
     public required IReadOnlyList<string> Verified { get; init; }
 
+    /// <summary>What the live editor said about this mount, if anyone asked it.</summary>
+    public required MountStatus Status { get; init; }
+
+    /// <summary>The operator's note from the verification file, verbatim.</summary>
+    public string? Note { get; init; }
+
+    /// <summary>
+    /// The single word the <c>verified</c> column carries. It is a status, not a boolean: a mount
+    /// the editor answered for reports which verbs answered, one that answered "nothing here"
+    /// reports <c>missing</c>, and one nobody asked reports <c>unverified</c>.
+    /// </summary>
+    public string VerifiedLabel => Status switch
+    {
+        MountStatus.Missing => "missing",
+        MountStatus.Verified when Verified.Count > 0 => string.Join('+', Verified),
+        MountStatus.Verified => "verified",
+        _ => "unverified"
+    };
+
     /// <summary>Highest-frequency display-name tokens under this scope; the atlas's vocabulary column.</summary>
     public IReadOnlyList<string> Vocabulary { get; init; } = [];
 }
@@ -122,15 +141,24 @@ public static class IndexWriters
         await using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
         await using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { NewLine = "\n" };
 
-        await writer.WriteLineAsync("scopeId\tuefnPath\tregistryPrefix\ttheme\trowCount\tsampleAssetName\tverified");
+        // The note column is what tells a reader WHY a scope reads the way it does - "grey render,
+        // may be an unloaded material" and "find_assets returned 0 rows" are very different reasons
+        // to be cautious, and neither survives being compressed into the status word.
+        await writer.WriteLineAsync("scopeId\tuefnPath\tregistryPrefix\ttheme\trowCount\tsampleAssetName\tverified\tnote");
         foreach (var scope in scopes)
         {
-            var verified = scope.Verified.Count == 0 ? "unverified" : string.Join('+', scope.Verified);
             await writer.WriteLineAsync(string.Join('\t',
                 scope.ScopeId, scope.UefnPath, scope.RegistryPrefix, scope.Theme,
-                scope.RowCount.ToString(), scope.SampleAssetName, verified));
+                scope.RowCount.ToString(), scope.SampleAssetName, scope.VerifiedLabel,
+                Flatten(scope.Note)));
         }
     }
+
+    /// <summary>A note is free text from an operator; a stray tab or newline would break the row.</summary>
+    private static string Flatten(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : value.ReplaceLineEndings(" ").Replace('\t', ' ').Trim();
 
     public static async Task WriteMetaAsync(string path, object meta)
         => await File.WriteAllTextAsync(path, JsonSerializer.Serialize(meta, MetaOptions) + "\n", new UTF8Encoding(false));
@@ -144,6 +172,24 @@ public static class IndexWriters
     public static async Task WriteAtlasAsync(string path, IReadOnlyList<ScopeRow> scopes, IndexCounts counts, string gameVersion)
     {
         var builder = new StringBuilder();
+
+        var verifiedCount = scopes.Count(scope => scope.Status is MountStatus.Verified);
+        var missingCount = scopes.Count(scope => scope.Status is MountStatus.Missing);
+        var unverifiedCount = scopes.Count - verifiedCount - missingCount;
+
+        // Built here rather than inline so the interpolated numbers do not wreck the paragraph's
+        // line wrapping inside the raw string literal below.
+        var missingPercent = counts.RowsUnderMissingMount == 0
+            ? 0
+            : counts.PreviewableUnderMissingMount * 100.0 / counts.RowsUnderMissingMount;
+
+        var missingPreviewNote = counts.RowsUnderMissingMount == 0
+            ? "No row on this dump has a PPID under a missing mount."
+            : $"Measured on this dump: of the {counts.RowsUnderMissingMount:N0} rows whose PPID sits in a "
+              + $"missing mount, **{counts.PreviewableUnderMissingMount:N0} ({missingPercent:N0}%) have an "
+              + "`sm` in a mount that is not itself missing**, so a preview is reachable for those and "
+              + "for those only. The remainder have no mesh at all, or a mesh in another missing mount; "
+              + "for them there is no preview route and you place blind.";
 
         builder.Append($"""
             # Fortnite creative asset atlas
@@ -206,10 +252,35 @@ public static class IndexWriters
 
             ## Scopes
 
-            `verified` says whether somebody actually drove the editor against that mount, and with
-            which verbs (`find`, `capture`, `place`, `resolve`). **`unverified` is the default and
-            means untested, not broken** - this dump can prove a path exists in the archive, never
-            that UEFN will accept it.
+            The `verified` column is a **status, not a boolean**, recording what the live editor
+            actually did when somebody drove it against that mount ({verifiedCount} verified,
+            {missingCount} missing, {unverifiedCount} unverified here):
+
+            | value | meaning |
+            | --- | --- |
+            | `find+capture` | `find_assets` returned rows there **and** `CaptureAssetImage` rendered a textured preview. Fully usable. |
+            | `find` | `find_assets` returned rows. Capture was either not attempted or came back untextured - search works, preview quality is unconfirmed. |
+            | `find+capture+place`, `resolve+place` | As above plus a confirmed placement. |
+            | `missing` | **`find_assets` returned nothing.** The mount is not exposed in the UEFN content browser at all - see below. |
+            | `unverified` | Nobody has asked the editor. **Untested, not broken** - this dump can prove a path exists in the archive, never that UEFN will accept it. |
+
+            `scopes.tsv` carries a `note` column with the operator's verbatim reason for each
+            non-default status; the table below omits it for width.
+
+            ### When a scope is `missing`
+
+            The mount is not in the content browser, so for a row whose `sc` names it:
+
+            * **Do not search or capture at that path.** `find_assets` will return nothing there and
+              `CaptureAssetImage` has nothing to render. An empty result is the mount being absent,
+              not the asset being absent.
+            * **Place it by its `ppid`.** Placement resolves an object path directly rather than
+              going through the browser - which is how a PPID under `/Burd_Comp` places. This has
+              not been probed on the missing mounts themselves, so treat it as the route to try
+              rather than a guarantee.
+            * **Look for the preview under the `sm`, not under `sc`.** A row's mesh and blueprint
+              usually live in a different mount from its PPID (often `/Game/Environments`), and that
+              mount has its own status. {missingPreviewNote}
 
             | scope | UEFN path | theme | rows | verified | sample vocabulary |
             | --- | --- | --- | ---: | --- | --- |
@@ -218,7 +289,7 @@ public static class IndexWriters
 
         foreach (var scope in scopes)
         {
-            var verified = scope.Verified.Count == 0 ? "unverified" : string.Join(", ", scope.Verified);
+            var verified = scope.VerifiedLabel.Replace("+", ", ");
             var vocabulary = scope.Vocabulary.Count == 0 ? "-" : string.Join(", ", scope.Vocabulary);
             builder.AppendLine($"| `{scope.ScopeId}` | `{scope.UefnPath}` | {Dash(scope.Theme)} | {scope.RowCount:N0} | {verified} | {vocabulary} |");
         }
@@ -253,4 +324,10 @@ public sealed record IndexCounts
     public required int Galleries { get; init; }
     public required int Scopes { get; init; }
     public required int Failures { get; init; }
+
+    /// <summary>Rows whose PPID lives in a mount UEFN does not expose in its content browser.</summary>
+    public int RowsUnderMissingMount { get; init; }
+
+    /// <summary>How many of those still have a mesh in a mount that is not itself missing.</summary>
+    public int PreviewableUnderMissingMount { get; init; }
 }

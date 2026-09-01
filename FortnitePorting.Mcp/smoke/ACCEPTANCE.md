@@ -478,6 +478,9 @@ lowercased, which is what makes plain English hit an asset called `BP_Helios_Jun
 `galleries.jsonl` rows are `{id, name, asset, sc, n, src, kw}`; a gallery's contents are found by
 grepping its `id` in `props-full.jsonl`, so the member list is never stored twice.
 
+`scopes.tsv` columns are `scopeId, uefnPath, registryPrefix, theme, rowCount, sampleAssetName,
+verified, note` — the last carrying the operator's verbatim reason for a non-default status.
+
 ## Picking the mesh: proxies are not the visual
 
 A blueprint usually names several static meshes and the first one is frequently a **shadow proxy** —
@@ -529,12 +532,15 @@ Archive mount (~4.7 s) is excluded; it is the same mount every CLI mode pays.
 | P2 galleries | all 2,169 `FortPlaysetItemDefinition`, one package load each; members read as `FSoftObjectPath` **strings** and joined by path (never `TryLoad`ed) | 2.2 s |
 | P3 placement | per prop: one package load, `ActorSaveRecord` → `TemplateRecords[*].ActorClass` soft path → `_C` class path | 69.1 s |
 | P4 mesh + bounds | blueprint load → collect every static mesh across SCS / `InheritableComponentHandler` / CDO / parent class → prefer a non-proxy → mesh load for render bounds | (same pass) |
-| P5 scopes | distinct mount prefixes, merged with `Config/mount-verification.json` | 0.2 s |
+| P5 scopes | distinct mount prefixes, merged with the 42 mounts in `Config/mount-verification.json` | 0.2 s |
 | P6 write | six files | 4.9 s |
-| **total** | | **77.5 s** |
+| **total** | | **59–78 s** |
 
-Collecting every mesh candidate instead of short-circuiting on the first cost **+12.6 s** (64.9 s →
-77.5 s), which buys the 174 corrected meshes above.
+Collecting every mesh candidate instead of short-circuiting on the first cost **+12.6 s** measured
+back-to-back (64.9 s → 77.5 s), which buys the 174 corrected meshes above. Run-to-run variance on
+this machine is wide — the same tier-b/bounds-core dump has landed anywhere from 59 s to 78 s
+depending on OS file cache — so treat the total as a range and the +12.6 s as the reliable figure,
+since it was measured on consecutive runs.
 
 `--tier a --bounds none` skips the mesh loads entirely. Tier controls the blueprint/mesh hop;
 `--bounds` controls the separate static-mesh load that measures it. The "core" subset (gallery
@@ -589,34 +595,93 @@ per row saying why.
 
 | file | raw bytes | gzip -9 |
 | --- | ---: | ---: |
-| `META.json` | 395 | 264 |
-| `atlas.md` | 35,580 | 10,974 |
-| `scopes.tsv` | 28,212 | 8,466 |
+| `META.json` | 562 | 333 |
+| `atlas.md` | 37,367 | 11,706 |
+| `scopes.tsv` | 35,633 | 9,599 |
 | `galleries.jsonl` | 550,684 | 68,902 |
 | `props-full.jsonl` | 18,483,308 | 1,822,768 |
 | `dump-report.log` | 206,805 | 20,385 |
-| **total** | **19,304,984** | **1,931,705** (whole dir, deflate) |
+| **total** | **19,314,359** | **1,933,693** (whole dir, deflate) |
 
-Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,304,984 raw, 3,743,517 → 1,931,705
-zipped.
+Dropping `props-core.jsonl` halved the dataset: 37,681,610 → 19,314,359 raw, 3,743,517 → 1,933,693
+zipped. The mount sweep added ~7 KB to `scopes.tsv` (the new `note` column) and ~1.8 KB to
+`atlas.md`.
 
 ## Mount verification
 
 `scopes.tsv` merges the generated mount table with hand-maintained `Config/mount-verification.json`,
 which ships next to the exe so an operator can record a newly verified mount after a live probe
-without rebuilding. `unverified` is the default and means **untested, not broken** — the dump can
-prove a path exists in the archive, never that UEFN will accept it. Two mounts are currently
-verified, both from live editor probes:
+without rebuilding.
 
-| scope | UEFN path | rows | verified |
-| --- | --- | ---: | --- |
-| `game.environments` | `/Game/Environments` | 13,624 | find + capture + place |
-| `burd_comp` | `/Burd_Comp` | 146 | resolve + place |
+The `verified` column is a **status, not a boolean**, and `scopes.tsv` now carries an eighth column,
+`note`, holding the operator's verbatim reason:
+
+| value | meaning |
+| --- | --- |
+| `find+capture` | `find_assets` returned rows **and** `CaptureAssetImage` rendered a **textured** preview. |
+| `find` | Search verified; capture either not attempted or returned an untextured render. Preview quality unconfirmed. |
+| `find+capture+place`, `resolve+place` | As above plus a confirmed placement. |
+| `missing` | `find_assets` returned **nothing** — the mount is not exposed in the UEFN content browser. |
+| `unverified` | Nobody has asked the editor. **Untested, not broken.** |
+
+A top-40-by-row-count sweep of the live editor produced the current table. Combined with the two
+pre-existing hand probes (neither `/Game/Environments` nor `/Burd_Comp` appears in the sweep, so
+both survive verbatim), `Config/mount-verification.json` now holds **42 mounts**:
+
+| status | scopes | source |
+| --- | ---: | --- |
+| `find+capture` | 19 | sweep, textured render |
+| `find` | 14 | sweep: 9 capture not attempted, 5 untextured render |
+| `find+capture+place` | 1 | earlier probe (`/Game/Environments`) |
+| `resolve+place` | 1 | earlier probe (`/Burd_Comp`) |
+| `missing` | 7 | sweep, `find_assets` returned 0 rows |
+| **verified total** | **35** | |
+
+Against the 273 scopes the dump generates: **35 verified / 7 missing / 231 unverified.**
+
+### The seven missing mounts
+
+| scope | UEFN path | rows |
+| --- | --- | ---: |
+| `suburban_assets` | `/Suburban_Assets` | 677 |
+| `suburban_composition` | `/Suburban_Composition` | 677 |
+| `sw_a_comp` | `/SW_A_Comp` | 520 |
+| `jethro` | `/Jethro` | 451 |
+| `city_comp` | `/City_Comp` | 442 |
+| `fnspaceingestion` | `/FNSpaceIngestion` | 285 |
+| `darkv_meadow_comp` | `/DarkV_Meadow_Comp` | 265 |
+
+One row verbatim from `scopes.tsv` (tab-separated):
+
+```
+suburban_composition	/Suburban_Composition	/Suburban_Composition		677	PPID_Suburban_Composition_BP_BlueHouse_BayWindow_A_BS_A_632fdff5	missing	find_assets returned 0 rows for this folder - the mount is not exposed in the UEFN content browser. Rows whose sc is this scope are not searchable or capturable AT THIS PATH; place them by ppid and look for a preview under their sm's own scope.
+```
+
+**2,189 rows have a PPID under a missing mount.** The atlas gives them a dedicated section telling
+an agent not to search or capture at that path, to place by `ppid` instead (flagged as the route to
+try, not a guarantee — placement was never probed on these mounts specifically), and to look for a
+preview under the row's `sm` scope rather than its `sc`.
+
+That last point was measured rather than asserted: **806 of the 2,189 (37%) have an `sm` in a mount
+that is not itself missing.** The other 63% have no mesh at all or a mesh in another missing mount —
+for those there is no preview route and the agent places blind. An early draft of the atlas said "a
+missing PPID mount very often still has a perfectly capturable `sm`"; the measurement contradicted
+it, and the generator now emits the fraction instead of the adjective. `META.json` carries the same
+numbers under `scopeStatus`.
 
 A row is counted against **every** mount it reaches — its PPID's, its blueprint's and its mesh's —
-not just its PPID's. Without that, neither verified mount would appear in the table at all: a prop's
-PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in shared
+not just its PPID's. Without that, neither hand-probed mount would appear in the table at all: a
+prop's PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in shared
 environment content (`/Game/Environments`), and it is the second one an agent scopes a search to.
+
+### Discrepancy in the sweep input
+
+The sweep's `summary` block disagrees with its own `results` array. Counting the 40 itemised
+results gives **19 `ok-textured` / 5 `ok-gray` / 16 `skipped`** (24 capture attempts); the summary
+claims **22 / 5 / 13** (27 attempts). The `find` counts agree (33 ok, 7 empty), so the
+verified/missing split is unaffected. The itemised results were used, since they are the per-scope
+evidence the table is built from. Worth resolving before the next sweep — one of the two is wrong
+about how many captures actually ran.
 
 ## Dropped: `props-core.jsonl`
 
@@ -649,6 +714,16 @@ say the same thing twice.
   are not applied, so a prop whose SCS scales its mesh reports the unscaled size.
 * **Only `Prop` is indexed.** Prefabs appear as galleries (name + membership + scope) but have no
   rows of their own, and no other category is covered.
-* **Only two mounts are verified**, and both verifications are single-asset probes. 271 of the 273
-  scopes are `unverified`, which is honest but means the scope table cannot yet tell a consumer
-  which mounts are safe to search.
+* **231 of the 273 scopes are still `unverified`.** The sweep covered the top 40 by row count, which
+  is most of the volume but a small share of the mounts. Everything below `/Dvoyager_Comp` (244
+  rows) is untested.
+* **Every verification is a one-or-few-asset probe.** `find` means one `find_assets` call returned
+  something, not that the mount is wholly browsable; `capture` means one asset rendered. A scope
+  marked `find+capture` can still contain assets that fail either.
+* **Five scopes captured grey.** Recorded as `find` with a note rather than `find+capture`, because
+  an untextured render is plausibly an unloaded-material artefact rather than a bad asset — but
+  nobody has confirmed which, so "preview quality unconfirmed" is the strongest claim available.
+* **`missing` is a statement about the mount, not about the props.** Placement by `ppid` under a
+  missing mount is expected to work — that is how `/Burd_Comp` behaves — but was never probed on the
+  seven missing mounts themselves. If it turns out not to, 2,189 rows are unreachable and the atlas
+  is currently telling agents to try anyway.

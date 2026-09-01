@@ -152,6 +152,29 @@ public sealed class AssetIndexDumper(
         var scopes = BuildScopes(rows);
         timings["P5 scopes"] = phase.Elapsed;
 
+        var verifiedScopes = scopes.Count(scope => scope.Status is MountStatus.Verified);
+        var missingScopes = scopes.Count(scope => scope.Status is MountStatus.Missing);
+        var missingScopeIds = scopes
+            .Where(scope => scope.Status is MountStatus.Missing)
+            .Select(scope => scope.ScopeId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        // Rows whose PPID sits in a mount the content browser does not expose. They still place;
+        // they just cannot be found or previewed at that path, which is worth saying out loud.
+        var underMissing = fullRows.Where(row => row.Sc is not null && missingScopeIds.Contains(row.Sc)).ToList();
+
+        // ...and of those, how many can still be PREVIEWED, because their mesh lives in some other
+        // mount that is not itself missing. This is the difference between "awkward" and "blind",
+        // and it is a measured fraction rather than a reassuring adjective.
+        var previewableUnderMissing = underMissing.Count(row =>
+            row.Sm is not null &&
+            ScopeOf(row.Sm) is { } meshScope &&
+            !missingScopeIds.Contains(meshScope.ScopeId));
+
+        Log.Information("[INDEX] P5: {Total} scopes - {Verified} verified, {Missing} missing, {Unverified} unverified; {Rows:N0} rows have a PPID under a missing mount ({Previewable:N0} of them still have a mesh somewhere previewable)",
+            scopes.Count, verifiedScopes, missingScopes, scopes.Count - verifiedScopes - missingScopes,
+            underMissing.Count, previewableUnderMissing);
+
         // ---------------------------------------------------------------- P6: write
         phase.Restart();
 
@@ -175,7 +198,9 @@ public sealed class AssetIndexDumper(
             FullRows = fullCount,
             Galleries = galleryCount,
             Scopes = scopes.Count,
-            Failures = failures.Count
+            Failures = failures.Count,
+            RowsUnderMissingMount = underMissing.Count,
+            PreviewableUnderMissingMount = previewableUnderMissing
         };
 
         var gameVersion = loader.GameVersion ?? SafeUnrealVersion();
@@ -195,6 +220,14 @@ public sealed class AssetIndexDumper(
             propRegistryRows = canonical.RegistryRows,
             propCollapsedRows = canonical.CollapsedRows,
             nameIndexReady = canonical.NameIndexReady,
+            scopeStatus = new
+            {
+                verified = verifiedScopes,
+                missing = missingScopes,
+                unverified = scopes.Count - verifiedScopes - missingScopes,
+                rowsUnderMissingMount = underMissing.Count,
+                previewableUnderMissingMount = previewableUnderMissing
+            },
             files = new
             {
                 propsFull = fullCount,
@@ -583,6 +616,8 @@ public sealed class AssetIndexDumper(
                     RowCount = members.Count,
                     SampleAssetName = first.Scope.Leaf,
                     Verified = mapper.VerifiedFor(first.Scope.UefnPath),
+                    Status = mapper.StatusFor(first.Scope.UefnPath),
+                    Note = mapper.NoteFor(first.Scope.UefnPath),
                     Vocabulary = TopTokens(members.Select(entry => entry.Row).ToList(), 8)
                 };
             })

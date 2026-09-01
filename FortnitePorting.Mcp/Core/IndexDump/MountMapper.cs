@@ -16,10 +16,30 @@ public sealed class MountVerification
     /// <summary>UEFN path prefix this note applies to, e.g. "/Game/Environments".</summary>
     public string UefnPath { get; set; } = string.Empty;
 
+    /// <summary>
+    /// "verified" (the editor answered for this path) or "missing" (find_assets returned nothing, so
+    /// the mount is not exposed in the content browser at all). Absent means: infer from
+    /// <see cref="Verified"/>.
+    /// </summary>
+    public string? Status { get; set; }
+
     /// <summary>find | capture | place | resolve, in whatever combination was actually observed.</summary>
     public List<string> Verified { get; set; } = [];
 
     public string? Note { get; set; }
+}
+
+/// <summary>What the live editor had to say about a mount.</summary>
+public enum MountStatus
+{
+    /// <summary>Nobody has probed it. The honest default - it does NOT mean broken.</summary>
+    Unverified,
+
+    /// <summary>find_assets returned nothing: the mount is not in the UEFN content browser.</summary>
+    Missing,
+
+    /// <summary>The editor answered for this path.</summary>
+    Verified
 }
 
 public sealed class MountVerificationFile
@@ -236,6 +256,22 @@ public sealed class MountMapper
     /// <summary>The verification verbs recorded for a scope, or an empty list when nobody has checked it.</summary>
     public IReadOnlyList<string> VerifiedFor(string uefnPath)
         => _verifications.TryGetValue(Normalize(uefnPath), out var found) ? found.Verified : [];
+
+    /// <summary>
+    /// Whether the editor was ever asked about this mount, and what it said. An explicit
+    /// <c>status</c> in the file wins; otherwise the presence of verbs means somebody verified it.
+    /// </summary>
+    public MountStatus StatusFor(string uefnPath)
+    {
+        if (!_verifications.TryGetValue(Normalize(uefnPath), out var found)) return MountStatus.Unverified;
+
+        return found.Status?.ToLowerInvariant() switch
+        {
+            "missing" => MountStatus.Missing,
+            "verified" => MountStatus.Verified,
+            _ => found.Verified.Count > 0 ? MountStatus.Verified : MountStatus.Unverified
+        };
+    }
 
     public string? NoteFor(string uefnPath)
         => _verifications.TryGetValue(Normalize(uefnPath), out var found) ? found.Note : null;
