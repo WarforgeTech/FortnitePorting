@@ -864,38 +864,24 @@ public static class ExportManifest
 
     // ---------------------------------------------------------------- helpers
 
+    /// <summary>
+    /// The manifest's JSON shape over <see cref="MeshBounds"/>. The measurement itself lives there
+    /// so the index dump reports the same centimetres this manifest does.
+    /// </summary>
     private static async Task<JsonNode?> ReadBoundsAsync(string objectPath, Func<string, Task<UObject?>> resolve)
     {
-        try
+        if (await MeshBounds.ReadAsync(objectPath, resolve) is not { } value) return null;
+
+        return new JsonObject
         {
-            if (string.IsNullOrEmpty(objectPath)) return null;
-
-            var asset = await resolve(objectPath);
-            var bounds = asset switch
-            {
-                UStaticMesh staticMesh => staticMesh.RenderData?.Bounds,
-                USkeletalMesh skeletalMesh => skeletalMesh.ImportedBounds,
-                _ => null
-            };
-
-            if (bounds is not { } value) return null;
-
-            return new JsonObject
-            {
-                ["origin"] = Vector(value.Origin),
-                ["boxExtent"] = Vector(value.BoxExtent),
-                ["sizeX"] = value.BoxExtent.X * 2,
-                ["sizeY"] = value.BoxExtent.Y * 2,
-                ["sizeZ"] = value.BoxExtent.Z * 2,
-                ["sphereRadius"] = value.SphereRadius,
-                ["units"] = "cm"
-            };
-        }
-        catch (Exception e)
-        {
-            Log.Debug("Bounds lookup failed for {Path}: {Message}", objectPath, e.Message);
-            return null;
-        }
+            ["origin"] = Vector(value.Origin),
+            ["boxExtent"] = Vector(value.BoxExtent),
+            ["sizeX"] = value.SizeX,
+            ["sizeY"] = value.SizeY,
+            ["sizeZ"] = value.SizeZ,
+            ["sphereRadius"] = value.SphereRadius,
+            ["units"] = "cm"
+        };
     }
 
     private static string FileNameOf(string path) => IoPath.GetFileName(path) ?? path;

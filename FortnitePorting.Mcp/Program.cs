@@ -5,6 +5,7 @@ using CUE4Parse_Conversion.Textures;
 using FortnitePorting;
 using FortnitePorting.Mcp.Config;
 using FortnitePorting.Mcp.Core;
+using FortnitePorting.Mcp.Core.IndexDump;
 using FortnitePorting.Mcp.Tools;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -52,6 +53,9 @@ try
 
     if (args.Contains("--nameindex", StringComparer.OrdinalIgnoreCase))
         return await CliModes.BuildNameIndexAsync(config, args);
+
+    if (args.Contains("--dump-index", StringComparer.OrdinalIgnoreCase))
+        return await CliModes.DumpIndexAsync(config, args);
 
     return await McpServerMode.RunAsync(config, args);
 }
@@ -300,6 +304,68 @@ internal static class CliModes
             Log.Information("  {Category,-18} {Status,-9} {Names,7:N0} names / {Rows,7:N0} rows", snapshot.Category, snapshot.State.Name, snapshot.Count, snapshot.Rows);
 
         return names.ReadyCategoryCount > 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// --dump-index &lt;outDir&gt; [--tier a|b] [--bounds core|all|none]: writes the grep-first asset
+    /// index dataset a customer agent uses with nothing but the stock UEFN editor MCP. See
+    /// <see cref="AssetIndexDumper"/> for what each phase costs and why.
+    /// </summary>
+    public static async Task<int> DumpIndexAsync(McpConfig config, string[] args)
+    {
+        var outputDirectory = McpConfig.GetArgumentValue(args, "--dump-index");
+        if (string.IsNullOrWhiteSpace(outputDirectory))
+        {
+            Log.Error("Usage: --dump-index <outDir> [--tier a|b] [--bounds core|all|none]");
+            return 1;
+        }
+
+        var tierArgument = McpConfig.GetArgumentValue(args, "--tier") ?? "b";
+        if (!Enum.TryParse<IndexTier>(tierArgument, ignoreCase: true, out var tier))
+        {
+            Log.Error("Unknown --tier \"{Tier}\". Use a or b.", tierArgument);
+            return 1;
+        }
+
+        var boundsArgument = McpConfig.GetArgumentValue(args, "--bounds") ?? "core";
+        if (!Enum.TryParse<BoundsScope>(boundsArgument, ignoreCase: true, out var bounds))
+        {
+            Log.Error("Unknown --bounds \"{Bounds}\". Use core, all or none.", boundsArgument);
+            return 1;
+        }
+
+        var services = new ServiceCollection();
+        McpServices.Register(services, config);
+        await using var provider = services.BuildServiceProvider();
+
+        var loader = provider.GetRequiredService<HeadlessLoader>();
+        var started = DateTime.Now;
+        await loader.WaitReadyAsync();
+        Log.Information("Archive ready in {Seconds:N1}s", (DateTime.Now - started).TotalSeconds);
+
+        var dumper = new AssetIndexDumper(
+            loader,
+            provider.GetRequiredService<AssetQuery>(),
+            provider.GetRequiredService<DisplayNameIndex>());
+
+        var result = await dumper.RunAsync(new IndexDumpOptions
+        {
+            OutputDirectory = outputDirectory,
+            Tier = tier,
+            Bounds = bounds
+        });
+
+        Log.Information("Index written to {Path} in {Seconds:N1}s", result.IndexDirectory, result.Elapsed.TotalSeconds);
+        foreach (var (name, elapsed) in result.PhaseTimings)
+            Log.Information("  {Phase,-14} {Seconds,7:N1}s", name, elapsed.TotalSeconds);
+
+        Log.Information("Rows: {Full:N0} full / {Core:N0} core props, {Galleries:N0} galleries, {Scopes:N0} scopes, {Failures:N0} failure lines",
+            result.Counts.FullRows, result.Counts.CoreRows, result.Counts.Galleries, result.Counts.Scopes, result.Counts.Failures);
+
+        foreach (var file in new DirectoryInfo(result.IndexDirectory).EnumerateFiles().OrderBy(file => file.Name, StringComparer.Ordinal))
+            Log.Information("  {Name,-20} {Bytes,12:N0} bytes", file.Name, file.Length);
+
+        return result.Counts.FullRows > 0 ? 0 : 2;
     }
 
     /// <summary>

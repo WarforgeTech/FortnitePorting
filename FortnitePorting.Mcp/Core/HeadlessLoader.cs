@@ -63,6 +63,13 @@ public class HeadlessLoader(McpConfig config)
 
     private FortniteVersionResponse? _resolvedVersion;
 
+    /// <summary>
+    /// The build string the FortnitePorting API reported for the archive we mounted (e.g. "37.20").
+    /// Null when the API was unreachable, so callers that stamp artefacts with it must degrade to
+    /// the Unreal version rather than failing.
+    /// </summary>
+    public string? GameVersion => _resolvedVersion?.Version;
+
     private static readonly List<DirectoryInfo> ExtraDirectories =
     [
         new(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FortniteGame", "Saved", "PersistentDownloadDir", "GameCustom", "InstalledBundles"))

@@ -1,0 +1,15 @@
+{
+  "comment": "Hand-maintained. An entry belongs here ONLY after somebody drove the stock UEFN editor MCP against that mount and watched the result. 'verified' verbs: find = find_assets(folder_path) returned rows; capture = CaptureAssetImage rendered an image; place = add_to_scene_from_asset spawned an actor; resolve = a PPID placement auto-resolved to its creative prop BP. A mount absent from this file is reported unverified, which is the honest default - the dump can prove a path exists in the archive, never that UEFN will accept it.",
+  "mounts": [
+    {
+      "uefnPath": "/Game/Environments",
+      "verified": ["find", "capture", "place"],
+      "note": "find_assets(folder_path='/Game/Environments', name='JuniperHedge') returned rows; CaptureAssetImage rendered the SM; add_to_scene_from_asset on the SM package path placed a FortStaticMeshActor."
+    },
+    {
+      "uefnPath": "/Burd_Comp",
+      "verified": ["resolve", "place"],
+      "note": "add_to_scene_from_asset on the PPID full object path (/Burd_Comp/SetupAssets/Maps/PPIDs/PPID_X.PPID_X) placed and auto-resolved to the creative prop BP actor. CaptureAssetImage on a PPID does NOT work."
+    }
+  ]
+}

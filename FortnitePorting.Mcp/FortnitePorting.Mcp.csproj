@@ -21,6 +21,19 @@
         <ProjectReference Include="..\Dependencies\CUE4Parse\CUE4Parse-Conversion\CUE4Parse-Conversion.csproj" />
     </ItemGroup>
 
+    <!--
+      Hand-maintained mount verification, merged onto the generated scope table by the dump-index
+      CLI mode.
+      It ships next to the exe rather than embedded so an operator can record a newly verified mount
+      after a live editor probe without rebuilding.
+    -->
+    <ItemGroup>
+        <Content Include="Config\mount-verification.json" Link="Config\mount-verification.json">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </Content>
+    </ItemGroup>
+
     <ItemGroup>
         <EmbeddedResource Include="..\FortnitePorting\Assets\Dependencies\binkadec.exe" Link="Assets\Dependencies\binkadec.exe" />
         <EmbeddedResource Include="..\FortnitePorting\Assets\Dependencies\radadec.exe" Link="Assets\Dependencies\radadec.exe" />

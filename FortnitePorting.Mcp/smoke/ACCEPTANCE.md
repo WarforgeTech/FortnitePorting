@@ -428,3 +428,174 @@ round-1 packing (`B=ambient occlusion`), which is exactly the error round 2 disp
 * **Every build recompiles this project**, because the stamp target rewrites the generated
   AssemblyInfo each time. Intentional: an exe that reports a build time it did not have would defeat
   the point.
+
+---
+
+# `--dump-index` — the grep-first asset index (CE-1)
+
+`FortnitePorting.Mcp.exe --dump-index <outDir> [--tier a|b] [--bounds core|all|none]` writes an
+`index/` dataset that a **customer agent holding only the stock UEFN editor MCP** greps to get from
+a human sentence to a placed prop. It answers the three things that MCP cannot: what string to
+search for, which of a prop's three identities each call wants, and how big the thing is.
+
+## Why three identities
+
+A creative prop is three different objects and the editor MCP treats them differently. These were
+established by driving the live editor, not inferred from the archive, and they are written into the
+generated `atlas.md` so the consumer never has to rediscover them by failing:
+
+* **`ppid`** — the `FortPlaysetPropItemDefinition` full object path. `add_to_scene_from_asset` on it
+  places and **auto-resolves to the creative prop BP actor**. Preferred placement identity.
+* **`bp`** — the blueprint **class** path, `_C`-suffixed. The bare package path *fails to load*, so
+  the column is written in class form and must not be trimmed.
+* **`sm`** — the static mesh package path. Places as a bare `FortStaticMeshActor`, and is the only
+  one of the three `CaptureAssetImage` will render. **Capture never works on a PPID**;
+  `GetAssetThumbnails` returns empty for unloaded plugin content (rendering is live-only).
+* Every `find_assets` call must be scoped with `folder_path` — unscoped is the documented way to
+  hang the editor.
+
+## Row schema (v1)
+
+```json
+{"id":"PPID_Burd_Comp_BP_Helios_JuniperHedge_Straight_d4d748db",
+ "name":"BP_Helios_JuniperHedge_Straight",
+ "ppid":"/Burd_Comp/SetupAssets/Maps/PPIDs/PPID_Burd_Comp_BP_Helios_JuniperHedge_Straight_d4d748db.PPID_Burd_Comp_BP_Helios_JuniperHedge_Straight_d4d748db",
+ "bp":"/Game/Environments/Asteria/Foliage/Hedges/JuniperHedges/Blueprints/BP_Helios_JuniperHedge_Straight.BP_Helios_JuniperHedge_Straight_C",
+ "sm":"/Game/Environments/Asteria/Foliage/Hedges/JuniperHedges/Meshes/SM_JuniperHedge_straight_fallback",
+ "sz":[439,226,211],"sc":"burd_comp",
+ "gal":["PID_FNEC_Burd_Gallery_c","PID_FNEC_Burd_Prefab_b","PID_FNEC_Desert_M_Prefab_Hotel",
+        "PID_FNEC_Desert_M_Prefab_Park","PID_FNEC_Desert_PropGallery_e",
+        "PID_FNEC_Harbor_PropGallery_a","PID_FNEC_Utopia_Gallery_c"],
+ "kw":["burd","city","deca","desert","gas","harbor","heatwave","hedge","helios","hotel","juniper",
+       "outdoor","park","prefab","sandy","square","station","store","straight","strip","town","utopia"]}
+```
+
+Keys are terse on purpose — the file is designed to be grepped whole, so every byte of key name is
+paid for 26,620 times. `sz` is the static mesh's render bounds in whole centimetres. `sc` joins to
+`scopes.tsv`. `kw` is name + gallery-name + theme + creative-tag tokens, camel-case split and
+lowercased, which is what makes plain English hit an asset called `BP_Helios_JuniperHedge_Straight`.
+
+`galleries.jsonl` rows are `{id, name, asset, sc, n, src, kw}`; a gallery's contents are found by
+grepping its `id` in `props-*.jsonl`, so the member list is never stored twice.
+
+## Pipeline and what each phase costs
+
+Measured on Fortnite **42.00**, 569,456 registry rows, 12-way parallel, warm name-index cache.
+Archive mount (4.6 s) is excluded; it is the same mount every CLI mode pays.
+
+| phase | what it does | tier b / bounds core |
+| --- | --- | ---: |
+| P1 canonical | `AssetQuery.CanonicalAsync(Prop)` — 105,512 registry rows → 26,620 deduped (78,892 folded) | 0.5 s |
+| P2 galleries | all 2,169 `FortPlaysetItemDefinition`, one package load each; members read as `FSoftObjectPath` **strings** and joined by path (never `TryLoad`ed) | 2.7 s |
+| P3 placement | per prop: one package load, `ActorSaveRecord` → `TemplateRecords[*].ActorClass` soft path → `_C` class path | 56.2 s |
+| P4 mesh + bounds | blueprint load → SCS / `InheritableComponentHandler` / CDO / parent-class walk → first `StaticMesh`; mesh load for render bounds | (same pass) |
+| P5 scopes | distinct mount prefixes, merged with `Config/mount-verification.json` | 0.2 s |
+| P6 write | seven files | 5.2 s |
+| **total** | | **64.9 s** |
+
+`--tier a --bounds none` (no mesh loads, no bounds) writes the same row set in **43.7 s**. Tier
+controls the blueprint/mesh hop; `--bounds` controls the separate static-mesh load that measures it.
+
+Loading gallery members as strings rather than `TryLoad`ing them is what keeps P2 at 2.7 s: a
+gallery's members are props P3 opens anyway, so loading them here would double the archive work for
+nothing. The save-record-collection walk is kept only as a fallback for galleries whose
+`AssociatedPlaysetProps` is empty — merging both sources unconditionally double-counts every prop.
+
+## Coverage
+
+| | count | of 26,620 |
+| --- | ---: | ---: |
+| rows shipped | 26,620 | 100% |
+| with `bp` | 26,620 | 100% |
+| with `sm` | 24,834 | 93.3% |
+| with `sz` | 24,622 | 92.5% |
+| galleries | 2,169 | — |
+| scopes | 273 | — |
+| failure lines | 1,787 | — |
+
+Failures are almost entirely one cause: **1,784 blueprints expose no `StaticMesh`** through the SCS,
+the inheritable-component handler, the CDO or the parent class — particle-only props, splines and
+volumes. Plus 2 blueprint classes that would not load and 1 gallery package
+(`JunoPlotPlaysetItemDefintion`) that would not load. Every one of those rows still ships with its
+`ppid`, `name`, `kw` and galleries; only `sm`/`sz` are null, and `dump-report.log` carries a line
+per row saying why.
+
+## Verification
+
+* **Spot row — JuniperHedge straight.** `ppid` is the known `/Burd_Comp` PPID, `bp` ends
+  `.BP_Helios_JuniperHedge_Straight_C`, `sm` is
+  `/Game/Environments/Asteria/Foliage/Hedges/JuniperHedges/Meshes/SM_JuniperHedge_straight_fallback`,
+  `sz` **`[439, 226, 211]`** — the expected value exactly. Full row above.
+* **Spot row — Apollo_BigBush.** `bp`
+  `/Game/Athena/Apollo/Environments/BuildingActors/Foliage/Apollo_BigBush.Apollo_BigBush_C`, `sm`
+  `/Game/Environments/Apollo/Foliage/BigBush/Meshes/BigBushShadowProxy`, `sz` `[1142, 1125, 785]`,
+  6 galleries.
+* **Spot row — Battlewood Boulevard Nature Gallery.** `n: 52`, `src: "associated"` — the expected
+  member count.
+* **Grep tests.** `grep -i hedge props-full.jsonl` → **109** rows (target >20).
+  `grep -i battlewood galleries.jsonl` → **8** (target 8).
+* **Determinism.** Two consecutive dumps into different directories: `atlas.md`, `scopes.tsv`,
+  `galleries.jsonl`, `props-core.jsonl`, `props-full.jsonl` and `dump-report.log` **byte-identical**;
+  `META.json` differs only in `generatedUtc`. Rows are sorted `(name, ppid)`, ids are handed out
+  after the sort, scope ids are stable and sorted by UEFN path, and keyword lists are sorted.
+* **`--selftest` PASSED in 4.9 s**, 12 tools registered.
+
+## Sizes
+
+| file | raw bytes | gzip -9 |
+| --- | ---: | ---: |
+| `META.json` | 420 | 272 |
+| `atlas.md` | 35,449 | 10,941 |
+| `scopes.tsv` | 28,212 | 8,465 |
+| `galleries.jsonl` | 550,684 | 68,902 |
+| `props-core.jsonl` | 18,374,034 | 1,812,201 |
+| `props-full.jsonl` | 18,486,006 | 1,823,279 |
+| `dump-report.log` | 206,805 | 20,385 |
+| **total** | **37,681,610** | **3,743,517** (whole dir, deflate) |
+
+## Mount verification
+
+`scopes.tsv` merges the generated mount table with hand-maintained `Config/mount-verification.json`,
+which ships next to the exe so an operator can record a newly verified mount after a live probe
+without rebuilding. `unverified` is the default and means **untested, not broken** — the dump can
+prove a path exists in the archive, never that UEFN will accept it. Two mounts are currently
+verified, both from live editor probes:
+
+| scope | UEFN path | rows | verified |
+| --- | --- | ---: | --- |
+| `game.environments` | `/Game/Environments` | 13,624 | find + capture + place |
+| `burd_comp` | `/Burd_Comp` | 146 | resolve + place |
+
+A row is counted against **every** mount it reaches — its PPID's, its blueprint's and its mesh's —
+not just its PPID's. Without that, neither verified mount would appear in the table at all: a prop's
+PPID lives in a composition plugin (`/Burd_Comp`) while its blueprint and mesh live in shared
+environment content (`/Game/Environments`), and it is the second one an agent scopes a search to.
+
+## Left open
+
+* **`props-core.jsonl` is 99.2% of `props-full.jsonl` (26,402 of 26,620) and earns nothing.** The
+  specified definition is "gallery members ∪ curated families", and it was measured: 26,237 of
+  26,620 props belong to at least one gallery (86,665 membership links), so the union degenerates to
+  "almost everything". Narrower definitions were measured too and do not help — restricting to
+  galleries whose *name* contains "Gallery" still gives 25,013; deduplicating by blueprint gives
+  26,454 distinct blueprints out of 26,620 rows, because `CanonicalAsync` already folded the 78,892
+  clones away. The generated atlas now says this in its file table and tells the reader to grep
+  `props-full.jsonl` instead. **CE-3 should either drop `props-core.jsonl` or redefine it** —
+  curated-families-only is 12,991 rows and is the only cut measured that halves the file.
+* **`name` is the game's own display name, which for creative props is usually an engineering name**
+  (`BP_Helios_JuniperHedge_Straight`, `Apollo_BigBush`). It is left verbatim rather than prettified,
+  because it is the string the archive actually holds; `kw` is what carries the plain English.
+* **`ULevelSaveRecord.HalfBoundsExtent` is zero on all 26,620 props.** It looked like a free
+  per-prop placement footprint that would cover rows whose mesh never resolves. It was implemented,
+  measured, found dead, and removed — a `PropMeshResolver` comment records the measurement so nobody
+  tries it again. Rows without a mesh therefore ship with no size at all.
+* **`sm` is the *first* static mesh a blueprint exposes**, not all of them. A multi-mesh prop (a shed
+  plus its door) gets one representative mesh and that mesh's bounds, which can understate the
+  prop's true footprint.
+* **Bounds are the mesh's, not the actor's.** Component transforms in the blueprint (scale, offset)
+  are not applied, so a prop whose SCS scales its mesh reports the unscaled size.
+* **Only `Prop` is indexed.** Prefabs appear as galleries (name + membership + scope) but have no
+  rows of their own, and no other category is covered.
+* **Only two mounts are verified**, and both verifications are single-asset probes. 271 of the 273
+  scopes are `unverified`, which is honest but means the scope table cannot yet tell a consumer
+  which mounts are safe to search.
