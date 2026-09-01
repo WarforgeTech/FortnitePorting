@@ -11,6 +11,7 @@
     <Project Path="FortnitePorting.Shared/FortnitePorting.Shared.csproj" />
   </Folder>
   <Folder Name="/Application/">
+    <Project Path="FortnitePorting.Mcp/FortnitePorting.Mcp.csproj" />
     <Project Path="FortnitePorting.Plugins/FortnitePorting.Plugins.csproj" />
     <Project Path="FortnitePorting/FortnitePorting.csproj" />
   </Folder>

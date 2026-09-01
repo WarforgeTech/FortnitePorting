@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>FortnitePorting.Mcp</RootNamespace>
+        <AssemblyName>FortnitePorting.Mcp</AssemblyName>
+        <InvariantGlobalization>false</InvariantGlobalization>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Serilog" />
+        <PackageReference Include="Serilog.Sinks.Console" />
+        <PackageReference Include="Serilog.Sinks.File" />
+        <PackageReference Include="ModelContextProtocol" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\FortnitePorting.Exporting\FortnitePorting.Exporting.csproj" />
+        <ProjectReference Include="..\FortnitePorting.CUE4Parse\FortnitePorting.CUE4Parse.csproj" />
+        <ProjectReference Include="..\Dependencies\CUE4Parse\CUE4Parse\CUE4Parse.csproj" />
+        <ProjectReference Include="..\Dependencies\CUE4Parse\CUE4Parse-Conversion\CUE4Parse-Conversion.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="..\FortnitePorting\Assets\Dependencies\binkadec.exe" Link="Assets\Dependencies\binkadec.exe" />
+        <EmbeddedResource Include="..\FortnitePorting\Assets\Dependencies\radadec.exe" Link="Assets\Dependencies\radadec.exe" />
+    </ItemGroup>
+</Project>
