@@ -40,13 +40,18 @@ public static class ExportTools
                  + "Each asset also gets a <AssetName>.manifest.json (path returned as manifestPath) listing the render mesh to import "
                  + "(primaryMesh - never the shadow proxy) and, per material slot, every texture parameter name with its exported file, "
                  + "plus scalar/vector/switch parameters. Exported meshes carry NO texture bindings, so read the manifest rather than "
-                 + "guessing slot->texture from file names.")]
+                 + "guessing slot->texture from file names. For a kitbash list of more than a handful of assets, set perAssetFolders=true "
+                 + "so each one lands in its own importable folder.")]
     public static async Task<CallToolResult> ExportAssetsAsync(
         IServiceProvider services,
         [Description("Full object paths to export, e.g. 'FortniteGame/Content/.../PID_Foo.PID_Foo'.")]
         string[] objectPaths,
         [Description("Optional output folder. When set, files land flat in this folder; when omitted they mirror the game path under the configured export root.")]
         string? outputDir = null,
+        [Description("Requires outputDir. False (default) puts every asset flat in outputDir together. True gives each asset its own "
+                     + "folder <outputDir>/<DisplayName>/ (flat inside, with a plain manifest.json), so one asset's textures cannot be "
+                     + "confused with another's; name collisions get a _2 suffix. Each asset's folder is returned as its outputRoot.")]
+        bool perAssetFolders = false,
         [Description("Style variants for cosmetics (outfits, backpacks, pickaxes, ...). Omit for the base look. "
                      + "Pass the string \"all\" to fold in EVERY option of every channel (what a FortnitePorting folder export does), "
                      + "or an object selecting one option per channel, e.g. {\"Style\":\"Black & Gold\"}. "
@@ -70,13 +75,16 @@ public static class ExportTools
         if (objectPaths is not { Length: > 0 })
             return Failure("objectPaths must contain at least one object path.");
 
+        if (perAssetFolders && string.IsNullOrWhiteSpace(outputDir))
+            return Failure("perAssetFolders=true needs an outputDir to create the per-asset folders under.");
+
         if (!TryParseOptions(outputDir, meshFormat, imageFormat, soundFormat, exportMaterials, out var options, out var optionError))
             return Failure(optionError!);
 
         if (!TryParseStyles(styles, out var styleSelection, out var styleError))
             return Failure(styleError!);
 
-        options = options with { Styles = styleSelection, ImportLobbyPoses = importLobbyPoses };
+        options = options with { Styles = styleSelection, ImportLobbyPoses = importLobbyPoses, PerAssetFolders = perAssetFolders };
 
         try
         {
@@ -485,7 +493,7 @@ public static class ExportTools
     /// object of channel -> option. Clients that can only send strings may send the object
     /// JSON-encoded; that is accepted too.
     /// </summary>
-    private static bool TryParseStyles(JsonElement? styles, out StyleSelection? selection, out string? error)
+    internal static bool TryParseStyles(JsonElement? styles, out StyleSelection? selection, out string? error)
     {
         selection = null;
         error = null;

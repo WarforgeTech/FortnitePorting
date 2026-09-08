@@ -151,13 +151,19 @@ reply carries a `note` saying so; `get_status → nameIndex` shows the per-categ
 
 ## Export layout
 
-`export_assets` has two modes:
+`export_assets` has three modes:
 
 * **`outputDir` omitted** — exports mirror the game path underneath the configured `ExportRoot`,
   e.g. `ExportRoot\Game\Athena\Items\...`. Good for building up a library that stays organised the
   way the game is.
 * **`outputDir` set** — everything lands *flat* in that one folder (mesh next to its textures).
   Good for a one-off you are about to import somewhere.
+* **`outputDir` set + `perAssetFolders: true`** — each asset gets its own folder
+  `<outputDir>\<Display Name>\`, flat inside, with a plain `manifest.json`. Colliding display names
+  (Fortnite has dozens of props called "Wall") take a `_2` suffix. Same layout `export_gallery`
+  produces per prop, and the one to use for a kitbash list, where a shared flat folder makes one
+  asset's textures indistinguishable from another's. Each asset's folder comes back as its
+  `outputRoot`.
 
 `export_gallery` resolves a gallery either by `galleryObjectPath` or by `galleryName` (matched
 against asset names and, once the Prefab index is ready, display names — an in-memory scan rather
@@ -174,6 +180,78 @@ or TGA, sounds WAV (other formats need `ffmpeg` on PATH).
 
 ---
 
+## Bulk export (`--export-list`)
+
+A kitbash list is hundreds of assets, and driving that through `export_assets` a call at a time
+either mounts the archive per call or blocks the agent for minutes with no visible progress.
+`--export-list` is the batch path: one process, one archive mount, assets exported sequentially into
+per-asset folders, with a machine-readable report rewritten after **every** asset.
+
+```powershell
+FortnitePorting.Mcp.exe --export-list kitbash.json D:\Kitbash --meshFormat Gltf2 --resume
+```
+
+| Flag | Meaning |
+|---|---|
+| `<list.json>` | Input list (positional, required). |
+| `<outputDir>` | Export root for this run (positional, required). |
+| `--meshFormat` | `UEFormat` (default), `ActorX`, `Gltf2`. |
+| `--imageFormat` | `PNG` (default) or `TGA`. |
+| `--styles` | `all`, or a channel→option object like `{"Style":"Black & Gold"}` — same union `export_assets` takes. |
+| `--resume` | Skip any entry whose folder already holds a `manifest.json`. |
+
+The list is a JSON array; only `objectPath` is required.
+
+```jsonc
+[
+  { "objectPath": "/CRP_CondoCanyon/.../PPID_..._Sandbag_A.PPID_..._Sandbag_A", "category": "Props" },
+  { "objectPath": "/Game/Athena/Items/Weapons/WID_...T03.WID_...T03",
+    "category": "Weapons", "folder": "SCAR_Ore_T03" }
+]
+```
+
+* `category` groups the asset into `<outputDir>\<category>\<name>\`.
+* `folder` names the folder outright; `displayName` is used when `folder` is absent. Either one
+  spares the run from opening the package just to learn the name — which is what makes a `--resume`
+  pass over an annotated list nearly free.
+* With neither, the folder is the asset's in-game display name, deduped with `_2` exactly as above.
+
+**Failures never abort the run.** A bad path fails its own entry and the next asset starts.
+Progress goes to stderr as `[n/total] status name — files, seconds (elapsed, ETA)`.
+
+`<outputDir>\export_report.json` is the run's ledger, rewritten (through a temp file, so a kill
+mid-write cannot truncate it) after every asset:
+
+```jsonc
+{
+  "mode": "export-list", "listPath": "...", "outputRoot": "...",
+  "meshFormat": "Gltf2", "imageFormat": "PNG", "styles": null, "resume": false,
+  "startedUtc": "...", "updatedUtc": "...",
+  "running": false,          // still true => the process died mid-run
+  "elapsedSeconds": 3.0, "etaSeconds": 0,
+  "total": 6, "processed": 6,
+  "ok": 5, "partial": 0, "failed": 1, "skipped": 0,
+  "totalFiles": 53, "totalBytes": 17716754,
+  "entries": [{
+    "index": 1, "objectPath": "...", "category": "Props", "displayName": "...",
+    "folder": "<abs>", "status": "ok",   // ok | partial | failed | skipped | pending
+    "seconds": 1.02, "fileCount": 13, "bytes": 3663309,
+    "manifestPath": "<abs>", "primaryMesh": "SM_Airborne_Sandbag_A.glb", "primaryMeshPath": "<abs>",
+    "files": ["<abs>", "..."], "missingArtifacts": [], "error": null
+  }]
+}
+```
+
+`partial` means the asset wrote files but dropped a primary artifact (see `missingArtifacts`) — the
+same distinction `export_assets` makes. Exit code is `0` when nothing failed, `2` when something
+did, `1` for a bad invocation.
+
+Resuming re-reads the previous report so skipped entries keep their file lists rather than going
+blank, and folder naming is deterministic for a given list order, so a resumed run lands on exactly
+the folders the first one created. Entries that *failed* are retried, not skipped.
+
+---
+
 ## Command-line modes
 
 Besides the default stdio server, the same exe carries its development harness:
@@ -183,6 +261,7 @@ Besides the default stdio server, the same exe carries its development harness:
 | `--tools` | Lists every registered tool with its input schema. |
 | `--call <tool> '<jsonArgs>'` | Invokes one tool in-process, prints the JSON, writes any images to `<DataDirectory>\call_output`. |
 | `--selftest` | End-to-end smoke: mount the archive, check the registry, extract the native dependencies, decode one icon, discover the tools. |
+| `--export-list <list.json> <outputDir> [--meshFormat …] [--imageFormat …] [--styles …] [--resume]` | Bulk export for kitbash lists: one archive mount, per-asset folders, resumable, `export_report.json`. See above. |
 | `--nameindex [--category <Name>]` | Builds the display-name index in the foreground with per-category timings and memory. |
 | `--iconcoverage <n> [--category <Name>]` | Samples a category through the icon resolver and reports how much real artwork (vs placeholder) it found. |
 

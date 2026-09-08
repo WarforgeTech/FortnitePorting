@@ -1017,3 +1017,99 @@ are fetched. The cache lives in `<DataDirectory>\Cache` and is swept on a 7-day 
 ## Build and publish
 
 `--selftest` PASSED (5.4 s, 12 tools). `dotnet publish -c Release` clean.
+
+---
+
+# Bulk export for kitbash lists (`--export-list`, `perAssetFolders`)
+
+Server: `publish\mcp\FortnitePorting.Mcp.exe` (Release), archive FN 42.00 local.
+
+## Symptom
+
+A kitbash list is hundreds of assets. `export_assets` could only put them all *flat* in one folder —
+where `T_Wall_A_D.png` belongs to whichever of six walls wrote it last — and driving it a call at a
+time either re-mounts the ~6 s archive per call or blocks the agent for minutes with no progress and
+no way to resume after an interruption.
+
+## What was added
+
+* **`ExportOptions.PerAssetFolders`** + an `export_assets` `perAssetFolders` argument (default
+  false, requires `outputDir`): each asset lands in `<outputDir>\<DisplayName>\`, flat inside, with
+  a plain `manifest.json`. Returned as that asset's `outputRoot`.
+* **`FolderNamer`** (`Core/ExportRunner.cs`) — the `_2` collision suffix, extracted from the gallery
+  path so both callers share one implementation, keyed per parent directory. Allocation is
+  deterministic for a given input order; that is precisely what makes a resumed run land on the
+  folders the first run made.
+* **`Core/ExportListRunner.cs`** + the `--export-list <list.json> <outputDir>` CLI mode: sequential
+  export in ONE process (one archive mount), `category` subfolders, `folder`/`displayName`
+  overrides, stderr progress with elapsed and ETA, and `export_report.json` rewritten via a temp
+  file after every asset. `--resume` skips entries whose folder already holds a `manifest.json` and
+  carries their previous report rows forward, so a resumed report is as complete as an
+  uninterrupted one. Sequential deliberately: `ExportRunner` serialises exports anyway (CUE4Parse
+  conversion keeps non-thread-safe static caches).
+
+## Results — 6-entry list, `--meshFormat Gltf2`
+
+Mixed on purpose: two props sharing a display name (collision suffix), one prop from another mount,
+a weapon, a pickaxe, and a bogus path (failure isolation).
+
+| # | entry | status | files | seconds |
+| --- | --- | --- | --- | --- |
+| 1 | `PPID_CRP_CondoCanyon_Artemis_Airborne_Sandbag_A` | ok | 13 | 1.02 |
+| 2 | `..._Artemis_Airborne_Sandbag_A_363f2c0b` (same display name) | ok | 13 | 0.38 |
+| 3 | `PPID_Ares_Comp_BP_Sungold_SandBag_A_08bc038b` | ok | 11 | 0.28 |
+| 4 | `WID_Assault_AutoHigh_Athena_R_Ore_T03` ("Assault Rifle") | ok | 9 | 0.86 |
+| 5 | `Pickaxe_ID_732_ShovelMale` ("Snowplower") | ok | 7 | 0.40 |
+| 6 | `/Game/Definitely/Not/A/Real/Asset.Asset` | **failed** | 0 | 0.00 |
+
+`5 ok, 0 partial, 1 failed, 0 skipped of 6` — 53 files, 17,716,754 bytes, **3.0 s of export** after
+a 6.0 s archive mount (9.7 s wall, single process). Exit code 2 (failures present); the bogus entry
+did not disturb the five around it, and its error text is on its own report row.
+
+Layout produced, confirming category grouping, the `folder` override and the collision suffix:
+
+```
+_bulktest\Pickaxes\Snowplower\            7 files + manifest.json
+_bulktest\Props\Artemis_Airborne_Sandbag_A\     13 files + manifest.json
+_bulktest\Props\Artemis_Airborne_Sandbag_A_2\   13 files + manifest.json   <- _2 suffix
+_bulktest\Props\BP_Sungold_SandBag_A\     11 files + manifest.json
+_bulktest\Weapons\SCAR_Ore_T03\            9 files + manifest.json         <- "folder" override
+_bulktest\export_report.json
+```
+
+No folder was left behind for the failed entry — an empty folder would have no manifest and so
+could never be skipped on resume, but leaving it would still be a lie about what exists.
+
+## Resume
+
+Same command with `--resume`: `0 ok, 0 partial, 1 failed, 5 skipped of 6` in **0.1 s** of export
+work, and `totalFiles`/`totalBytes` came back byte-identical (53 / 17,716,754) because skipped rows
+carry their previous entries forward rather than reporting zero. The bogus entry is **retried and
+fails again** — failures are not memoised, only successes are skipped.
+
+## `perAssetFolders` via `--call`
+
+`--call export_assets` with `perAssetFolders:true` and two props: `status: ok`, 2 assets, 24 files,
+each asset's `outputRoot` its own folder (`_perassettest\Artemis_Airborne_Sandbag_A\` 13 files,
+`_perassettest\BP_Sungold_SandBag_A\` 11 files), each with `manifest.json`, `primaryMesh` and
+`primaryMeshPath` pointing inside it. 1,021 ms.
+
+## Notes and remaining limits
+
+* `perAssetFolders:true` without `outputDir` is rejected with an explanatory error rather than
+  silently exporting flat.
+* Textures shared between assets are written once per folder — the same deliberate duplication
+  `export_gallery` makes, and the price of independent importability.
+* Determinism of folder naming depends on **list order**. Reordering a list and then resuming
+  re-exports rather than skipping; that is a property of naming by display name, not a bug.
+* An entry with neither `folder` nor `displayName` still opens its package on a resume pass, to
+  learn the display name that names the folder. Annotating a list with `displayName` avoids that.
+* The `running: true` flag left in a report is the only signal that a run died mid-flight; nothing
+  yet cleans it up automatically on the next run beyond overwriting it.
+
+## Build and publish
+
+`--selftest` PASSED (5.0 s, 12 tools, 575,132 registry rows). `dotnet publish -c Release` clean.
+Published to a staging directory and copied into both `publish\mcp` trees; the live `fortnite-assets`
+processes hold the exe open, so the running image is renamed to `.exe.old` and the new one copied
+into the freed name (Windows permits renaming a mapped image), then the `.old` swept.

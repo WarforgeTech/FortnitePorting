@@ -3,6 +3,7 @@ using CUE4Parse.UE4.AssetRegistry.Objects;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse_Conversion.Textures;
 using FortnitePorting;
+using FortnitePorting.Exporting;
 using FortnitePorting.Mcp.Config;
 using FortnitePorting.Mcp.Core;
 using FortnitePorting.Mcp.Core.IndexDump;
@@ -14,6 +15,7 @@ using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Serilog;
 using SkiaSharp;
+using EMeshFormat = CUE4Parse_Conversion.Options.EMeshFormat;
 
 // RULE 1 (see mcp-spike/WIRING.md §4): first executable statement. The stdio transport takes the
 // raw stdout handle via Console.OpenStandardOutput, so this redirect cannot corrupt the protocol -
@@ -44,6 +46,9 @@ try
 
     if (args.Contains("--call", StringComparer.OrdinalIgnoreCase))
         return await CliModes.CallAsync(config, args);
+
+    if (args.Contains("--export-list", StringComparer.OrdinalIgnoreCase))
+        return await CliModes.ExportListAsync(config, args);
 
     if (args.Contains("--iconcoverage", StringComparer.OrdinalIgnoreCase))
         return await CliModes.IconCoverageAsync(config, args);
@@ -305,6 +310,127 @@ internal static class CliModes
 
         return names.ReadyCategoryCount > 0 ? 0 : 1;
     }
+
+    /// <summary>
+    /// --export-list &lt;list.json&gt; &lt;outputDir&gt; [--meshFormat Gltf2] [--imageFormat PNG]
+    /// [--styles all] [--resume]: bulk export for kitbash lists. Hundreds of assets go through ONE
+    /// process - so the archive is mounted once - each into its own folder, with
+    /// <c>export_report.json</c> rewritten after every asset so the run is resumable and a failure
+    /// never aborts it.
+    /// </summary>
+    public static async Task<int> ExportListAsync(McpConfig config, string[] args)
+    {
+        const string usage = "Usage: --export-list <list.json> <outputDir> [--meshFormat UEFormat|ActorX|Gltf2] "
+                             + "[--imageFormat PNG|TGA] [--styles all|{\"Style\":\"...\"}] [--resume]";
+
+        var index = Array.FindIndex(args, arg => arg.Equals("--export-list", StringComparison.OrdinalIgnoreCase));
+        var listPath = Positional(args, index + 1);
+        var outputDir = Positional(args, index + 2);
+
+        if (string.IsNullOrWhiteSpace(listPath) || string.IsNullOrWhiteSpace(outputDir))
+        {
+            Log.Error(usage);
+            return 1;
+        }
+
+        if (!File.Exists(listPath))
+        {
+            Log.Error("List file does not exist: {Path}", listPath);
+            return 1;
+        }
+
+        var meshFormatArgument = McpConfig.GetArgumentValue(args, "--meshFormat") ?? "UEFormat";
+        if (!Enum.TryParse<EMeshFormat>(meshFormatArgument, ignoreCase: true, out var meshFormat))
+        {
+            Log.Error("Unknown --meshFormat \"{Value}\". Valid: {Valid}.", meshFormatArgument, string.Join(", ", Enum.GetNames<EMeshFormat>()));
+            return 1;
+        }
+
+        var imageFormatArgument = McpConfig.GetArgumentValue(args, "--imageFormat") ?? "PNG";
+        if (!Enum.TryParse<EImageFormat>(imageFormatArgument, ignoreCase: true, out var imageFormat))
+        {
+            Log.Error("Unknown --imageFormat \"{Value}\". Valid: {Valid}.", imageFormatArgument, string.Join(", ", Enum.GetNames<EImageFormat>()));
+            return 1;
+        }
+
+        // Same union the export_assets tool accepts, parsed by the same code: "all" or {channel:option}.
+        StyleSelection? styles = null;
+        if (McpConfig.GetArgumentValue(args, "--styles") is { Length: > 0 } stylesArgument)
+        {
+            var element = JsonSerializer.SerializeToElement(stylesArgument);
+            if (!ExportTools.TryParseStyles(element, out styles, out var styleError))
+            {
+                Log.Error("{Error}", styleError);
+                return 1;
+            }
+        }
+
+        var options = new ExportListOptions
+        {
+            ListPath = listPath,
+            OutputDir = outputDir,
+            MeshFormat = meshFormat,
+            ImageFormat = imageFormat,
+            Styles = styles,
+            Resume = args.Contains("--resume", StringComparer.OrdinalIgnoreCase)
+        };
+
+        List<ExportListItem> preview;
+        try
+        {
+            preview = ExportListRunner.ReadList(listPath);
+        }
+        catch (Exception e)
+        {
+            Log.Error("Could not read {Path}: {Message}", listPath, e.Message);
+            return 1;
+        }
+
+        if (preview.Count == 0)
+        {
+            Log.Error("{Path} contains no entries.", listPath);
+            return 1;
+        }
+
+        var services = new ServiceCollection();
+        McpServices.Register(services, config);
+        await using var provider = services.BuildServiceProvider();
+
+        var loader = provider.GetRequiredService<HeadlessLoader>();
+        Log.Information("Loading archive for {Count} list entries...", preview.Count);
+        var started = DateTime.Now;
+        await loader.WaitReadyAsync();
+        Log.Information("Archive ready in {Seconds:N1}s", (DateTime.Now - started).TotalSeconds);
+
+        var runner = new ExportListRunner(loader, provider.GetRequiredService<ExportRunner>());
+
+        ExportListReport report;
+        try
+        {
+            report = await runner.RunAsync(options, CancellationToken.None);
+        }
+        catch (Exception e)
+        {
+            Log.Error(e, "--export-list failed");
+            return 1;
+        }
+
+        Log.Information("Export list finished in {Seconds:N1}s - {Ok} ok, {Partial} partial, {Failed} failed, {Skipped} skipped of {Total}",
+            report.ElapsedSeconds, report.Ok, report.Partial, report.Failed, report.Skipped, report.Total);
+        Log.Information("{Files:N0} files, {Bytes:N0} bytes under {Root}", report.TotalFiles, report.TotalBytes, report.OutputRoot);
+        Log.Information("Report: {Path}", Path.Combine(report.OutputRoot, ExportListRunner.ReportFileName));
+
+        foreach (var entry in report.Entries.Where(row => row.Status is "failed" or "partial"))
+            Log.Warning("  {Status,-7} {Path}: {Error}", entry.Status, entry.ObjectPath, entry.Error ?? "(no detail)");
+
+        return report.Failed == 0 ? 0 : 2;
+    }
+
+    /// <summary>Reads a positional argument, treating a following flag as "absent".</summary>
+    private static string? Positional(string[] args, int index)
+        => index >= 0 && index < args.Length && !args[index].StartsWith("--", StringComparison.Ordinal)
+            ? args[index]
+            : null;
 
     /// <summary>
     /// --dump-index &lt;outDir&gt; [--tier a|b] [--bounds core|all|none]: writes the grep-first asset

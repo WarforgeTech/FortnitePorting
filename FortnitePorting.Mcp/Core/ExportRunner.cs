@@ -52,6 +52,16 @@ public record ExportOptions
 
     /// <summary>Set false to skip manifest generation entirely (geometry-only exports).</summary>
     public bool WriteManifest { get; init; } = true;
+
+    /// <summary>
+    /// Batch exports only, and only meaningful together with <see cref="OutputDir"/>: give every
+    /// asset its own folder under it (<c>&lt;OutputDir&gt;\&lt;DisplayName&gt;\</c>, flat inside,
+    /// with a plain <c>manifest.json</c>) instead of letting all of them share one flat folder.
+    /// Same layout - and the same <c>_2</c> collision suffix - as the per-prop gallery path.
+    /// Ignored by <see cref="ExportRunner.ExportOne"/>, which always exports into the folder it is
+    /// handed.
+    /// </summary>
+    public bool PerAssetFolders { get; init; }
 }
 
 public record ExportedFile(string Path, long Bytes);
@@ -154,6 +164,8 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
         Directory.CreateDirectory(outputRoot);
 
         var result = new ExportResult { OutputRoot = outputRoot };
+        var perAssetFolders = opts is { PerAssetFolders: true, OutputDir: not null };
+        var folders = new FolderNamer();
 
         foreach (var objectPath in objectPaths.Where(path => !string.IsNullOrWhiteSpace(path)))
         {
@@ -170,13 +182,27 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 continue;
             }
 
-            var single = await ExportOne(asset, objectPath, opts, token);
+            var assetOptions = opts;
+            string? assetFolder = null;
+            if (perAssetFolders)
+            {
+                assetFolder = IoPath.Combine(outputRoot, folders.Next(outputRoot, DisplayNameOf(asset) ?? asset.Name));
+                Directory.CreateDirectory(assetFolder);
+
+                // Each asset owns its folder, so the manifest gets the plain, predictable name there.
+                assetOptions = opts with { OutputDir = assetFolder, ManifestFileName = "manifest.json" };
+            }
+
+            var single = await ExportOne(asset, objectPath, assetOptions, token);
             if (single.Failure is not null) result.Failures.Add(single.Failure);
             if (single.Asset is not null)
             {
                 result.Assets.Add(single.Asset);
                 AddMissingArtifactFailure(result.Failures, objectPath, single.Asset);
             }
+
+            // Do not leave a folder behind for an asset that produced nothing.
+            if (assetFolder is not null) DeleteIfEmpty(assetFolder);
         }
 
         return result;
@@ -224,23 +250,12 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             MembersFound = members.Count
         };
 
-        var usedFolders = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var folders = new FolderNamer();
         foreach (var member in members)
         {
             token.ThrowIfCancellationRequested();
 
-            var folderName = SanitizeFileName(member.Name);
-            if (usedFolders.TryGetValue(folderName, out var seen))
-            {
-                usedFolders[folderName] = seen + 1;
-                folderName = $"{folderName}_{seen + 1}";
-            }
-            else
-            {
-                usedFolders[folderName] = 1;
-            }
-
-            var propDir = IoPath.Combine(root, folderName);
+            var propDir = IoPath.Combine(root, folders.Next(root, member.Name));
             Directory.CreateDirectory(propDir);
 
             // Each prop owns its folder, so the manifest gets the plain, predictable name there.
@@ -255,13 +270,7 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             }
 
             // Do not leave a folder behind for a prop that produced nothing.
-            try
-            {
-                if (Directory.Exists(propDir) && !Directory.EnumerateFileSystemEntries(propDir).Any())
-                    Directory.Delete(propDir);
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            DeleteIfEmpty(propDir);
         }
 
         return result;
@@ -874,6 +883,17 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
 
     // ---------------------------------------------------------------- helpers
 
+    internal static void DeleteIfEmpty(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory) && !Directory.EnumerateFileSystemEntries(directory).Any())
+                Directory.Delete(directory);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
     public static string SanitizeFileName(string name)
     {
         var invalid = IoPath.GetInvalidFileNameChars();
@@ -888,5 +908,34 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
             messages.Add($"{current.GetType().Name}: {current.Message}");
 
         return string.Join(" -> ", messages);
+    }
+}
+
+/// <summary>
+/// Hands out one filesystem-safe folder name per asset, per parent directory. Two assets that
+/// share a display name - common in Fortnite, where dozens of props are "Wall" - get
+/// <c>Wall</c> and <c>Wall_2</c> rather than clobbering each other's textures.
+/// <para>
+/// Allocation is deterministic for a given input order, which is what makes a resumed
+/// <c>--export-list</c> run land on the same folders it did the first time.
+/// </para>
+/// </summary>
+internal sealed class FolderNamer
+{
+    private readonly Dictionary<string, int> _used = new(StringComparer.OrdinalIgnoreCase);
+
+    public string Next(string parentDirectory, string name)
+    {
+        var folderName = ExportRunner.SanitizeFileName(name);
+        var key = $"{parentDirectory}|{folderName}";
+
+        if (!_used.TryGetValue(key, out var seen))
+        {
+            _used[key] = 1;
+            return folderName;
+        }
+
+        _used[key] = seen + 1;
+        return $"{folderName}_{seen + 1}";
     }
 }
