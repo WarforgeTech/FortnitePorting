@@ -48,7 +48,18 @@ variable. Every field is optional.
   "MappingsFileOverride": null,
 
   // Localisation for display names. Default English.
-  "Language": "English"
+  "Language": "English",
+
+  // Mount Fortnite's IoStore on-demand containers. Default true, and you want it true:
+  // cosmetic and weapon textures ship in the local paks with ONLY their lowest mip, so with
+  // this off a SCAR or a pickaxe exports 64x64 diffuse maps. Costs an Epic OAuth call and
+  // roughly +1s on the archive mount (+6s the first time, while container tocs are cached).
+  // get_status reports the outcome under "textureStreaming".
+  "UseTextureStreaming": true,
+
+  // On-demand chunk request timeout, and how long a cached chunk survives in <DataDirectory>\Cache.
+  "ChunkRequestTimeoutSeconds": 30,
+  "ChunkCacheLifetimeDays": 7
 }
 ```
 

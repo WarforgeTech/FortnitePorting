@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Http.Headers;
 using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider.Vfs;
@@ -8,6 +9,7 @@ using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.AssetRegistry.Objects;
 using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse.UE4.Assets.Exports.Engine;
+using CUE4Parse.UE4.IO;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.UObject;
@@ -32,9 +34,27 @@ public abstract record LoadState
 }
 
 /// <summary>
+/// What the on-demand (streamed-texture) stage managed to do. Reported verbatim by get_status:
+/// "enabled but not mounted" is the state where every cosmetic and weapon texture silently comes
+/// out at its 64x64 stub mip, and that has to be visible without reading the log.
+/// </summary>
+public record TextureStreamingStatus
+{
+    public bool Enabled { get; init; }
+    public bool Authenticated { get; init; }
+    public int MountedContainers { get; init; }
+    public string? TocPath { get; init; }
+    public string? Error { get; init; }
+
+    public bool Mounted => MountedContainers > 0;
+}
+
+/// <summary>
 /// Headless port of the GUI's CUE4ParseService loading pipeline. Only the
-/// "latest installed local archive" path is supported; on-demand streaming,
-/// the cache sweeper, and all UI concerns are dropped.
+/// "latest installed local archive" path is supported; the live-manifest (LatestOnDemand)
+/// installation type, the cache sweeper's UI, and all other UI concerns are dropped.
+/// On-demand TEXTURE streaming is kept: without it every cosmetic/weapon texture exports as
+/// its lowest mip, because the local paks only carry that one.
 /// </summary>
 public class HeadlessLoader(McpConfig config)
 {
@@ -58,10 +78,15 @@ public class HeadlessLoader(McpConfig config)
     public readonly Dictionary<string, string> SetNames = [];
 
     private readonly FortnitePortingApi _api = new(config.DataFolder);
+    private readonly EpicGamesApi _epicApi = new(config.DataFolder);
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim _loadGate = new(1, 1);
 
     private FortniteVersionResponse? _resolvedVersion;
+    private string? _epicAuthToken;
+
+    /// <summary>State of the streamed-texture (IoStore on-demand) mount; surfaced by get_status.</summary>
+    public TextureStreamingStatus TextureStreaming { get; private set; } = new() { Enabled = config.UseTextureStreaming };
 
     /// <summary>
     /// The build string the FortnitePorting API reported for the archive we mounted (e.g. "37.20").
@@ -112,9 +137,15 @@ public class HeadlessLoader(McpConfig config)
             var stages = new List<Stage>
             {
                 new("Initializing Compression", 1, InitializeCompression),
+                // Auth must precede the provider setup: OnDemandOptions captures the bearer token
+                // at construction, and the provider registers the local .uondemandtoc files (which
+                // immediately pull their container tocs from the CDN) the moment it initializes.
+                new("Authenticating with Epic", 2, InitializeEpicAuth),
                 new("Initializing CUE4Parse", 5, InitializeProviderSetup),
+                new("Removing Outdated Cache Files", 1, CleanupCache),
                 new("Loading Detex", 1, InitializeDetex),
                 new("Initializing Provider", 10, InitializeProvider),
+                new("Loading Texture Streaming", 5, InitializeTextureStreaming),
                 new("Submitting Keys", 20, LoadKeys),
                 new("Loading Virtual Paths", 15, LoadVirtualPaths),
                 new("Loading Mappings", 1, LoadMappings),
@@ -179,6 +210,31 @@ public class HeadlessLoader(McpConfig config)
         }
     }
 
+    /// <summary>
+    /// Port of the GUI's <c>Api.EpicGames.VerifyAuthAsync()</c> call inside InitializeProvider.
+    /// Non-fatal by construction: no token simply means no streamed mips.
+    /// </summary>
+    private async Task InitializeEpicAuth()
+    {
+        if (!Config.UseTextureStreaming)
+        {
+            Log.Information("Texture streaming disabled by config; skipping Epic authentication");
+            return;
+        }
+
+        _epicAuthToken = await _epicApi.GetTokenAsync();
+        TextureStreaming = TextureStreaming with { Authenticated = _epicAuthToken is not null };
+
+        if (_epicAuthToken is null)
+        {
+            TextureStreaming = TextureStreaming with
+            {
+                Error = "Could not obtain an Epic auth token; streamed textures will export at their lowest mip."
+            };
+            Log.Warning("No Epic auth token: on-demand texture streaming will be unavailable (textures export at their lowest mip)");
+        }
+    }
+
     private async Task InitializeProviderSetup()
     {
         if (!Directory.Exists(Config.ArchiveDirectory))
@@ -197,7 +253,23 @@ public class HeadlessLoader(McpConfig config)
 
         ObjectTypeRegistry.RegisterEngine(typeof(UFortGameFeatureData).Assembly);
 
-        _provider.LoadOnDemandTocs = false;
+        Log.Information("Texture Streaming: {UseTextureStreaming}", Config.UseTextureStreaming);
+
+        // OnDemandOptions has to exist before any .uondemandtoc is registered: CUE4Parse silently
+        // drops the registration when it is null (AbstractVfsFileProvider.RegisterVfsAsync).
+        var streamingReady = Config.UseTextureStreaming && _epicAuthToken is not null;
+        if (streamingReady)
+        {
+            _provider.OnDemandOptions = new IoStoreOnDemandOptions
+            {
+                ChunkHostUri = new Uri("https://egdownload.fastly-edge.com/", UriKind.Absolute),
+                ChunkCacheDirectory = Config.CacheFolder,
+                Authorization = new AuthenticationHeaderValue("Bearer", _epicAuthToken),
+                Timeout = TimeSpan.FromSeconds(Config.ChunkRequestTimeoutSeconds)
+            };
+        }
+
+        _provider.LoadOnDemandTocs = streamingReady;
         _provider.LoadExtraDirectories = true;
         _provider.ReadNaniteData = false;
 
@@ -218,9 +290,156 @@ public class HeadlessLoader(McpConfig config)
         DetexHelper.Initialize(detexPath);
     }
 
+    /// <summary>Port of the GUI's CleanupCache stage: drop chunk-cache files older than the lifetime.</summary>
+    private async Task CleanupCache()
+    {
+        try
+        {
+            var cutoff = DateTime.Now - TimeSpan.FromDays(Config.ChunkCacheLifetimeDays);
+            foreach (var file in Config.CacheFolder.GetFiles())
+            {
+                if (file.LastWriteTime >= cutoff) continue;
+                file.Delete();
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Warning("Failed to sweep the chunk cache: {Message}", e.Message);
+        }
+
+        await Task.CompletedTask;
+    }
+
     private async Task InitializeProvider()
     {
         await _provider!.InitializeAsync();
+    }
+
+    /// <summary>
+    /// Port of the GUI's <c>InitializeTextureStreaming</c> stage. Fortnite's cosmetic and weapon
+    /// textures are IoStore ON-DEMAND: the installed paks hold only the lowest mip and everything
+    /// above it is fetched from Epic's CDN through an on-demand toc. Two sources of that toc are
+    /// tried, in the GUI's order of preference:
+    ///   1. Cloud/IoStoreOnDemand.ini next to the install, whose [Endpoint] TocPath names a toc on
+    ///      download.epicgames.com. Downloaded once into the cache folder.
+    ///   2. The .uondemandtoc files already sitting in the Paks folder, registered by the provider
+    ///      during InitializeProvider (that path needs nothing here beyond OnDemandOptions).
+    /// Every failure is a warning: a load that cannot stream still exports, just at low mips.
+    /// </summary>
+    private async Task InitializeTextureStreaming()
+    {
+        if (!Config.UseTextureStreaming)
+        {
+            Log.Information("Texture streaming disabled by config (UseTextureStreaming=false)");
+            return;
+        }
+
+        if (_provider!.OnDemandOptions is null)
+        {
+            // Auth failed - the message is already on TextureStreaming.Error.
+            Log.Warning("Skipping texture streaming: no on-demand options (Epic authentication failed)");
+            return;
+        }
+
+        try
+        {
+            var tocPath = await GetTocPathAsync();
+            if (!string.IsNullOrEmpty(tocPath))
+            {
+                Log.Information("Found on-demand toc path: {TocPath}", tocPath);
+                TextureStreaming = TextureStreaming with { TocPath = tocPath };
+
+                var tocName = tocPath.SubstringAfterLast("/");
+                var onDemandFile = new FileInfo(Path.Combine(Config.CacheFolder.FullName, tocName));
+                if (!onDemandFile.Exists || onDemandFile.Length == 0)
+                {
+                    await DownloadFileAsync($"https://download.epicgames.com/{tocPath}", onDemandFile.FullName);
+                    onDemandFile.Refresh();
+                }
+
+                if (onDemandFile is { Exists: true, Length: > 0 })
+                    await _provider.RegisterVfsAsync(new IoChunkToc(onDemandFile.FullName, _provider.Versions));
+                else
+                    Log.Warning("On-demand toc {Name} could not be downloaded", tocName);
+            }
+            else
+            {
+                // Normal on an install without the Cloud ini; the local .uondemandtoc files
+                // registered during InitializeProvider still provide streaming.
+                Log.Information("No Cloud/IoStoreOnDemand.ini endpoint found; relying on the local .uondemandtoc files");
+            }
+
+            await _provider.MountAsync();
+
+            var onDemandReaders = _provider.MountedVfs.OfType<IoStoreOnDemandReader>().Count();
+            TextureStreaming = TextureStreaming with { MountedContainers = onDemandReaders };
+
+            if (onDemandReaders > 0)
+            {
+                Log.Information("Texture streaming mounted: {Count} on-demand container(s)", onDemandReaders);
+            }
+            else
+            {
+                TextureStreaming = TextureStreaming with
+                {
+                    Error = "No on-demand containers mounted; streamed textures will export at their lowest mip."
+                };
+                Log.Warning("Texture streaming produced no on-demand containers - textures will export at their lowest mip. "
+                            + "Enable \"Pre-Download Streamed Assets\" for Fortnite in the Epic Games Launcher if this persists.");
+            }
+        }
+        catch (Exception e)
+        {
+            TextureStreaming = TextureStreaming with { Error = e.Message };
+            Log.Warning(e, "Failed to initialize texture streaming; continuing with low-resolution mips");
+        }
+    }
+
+    /// <summary>
+    /// Reads [Endpoint] TocPath out of Cloud/IoStoreOnDemand.ini, three levels above the Paks
+    /// folder. The GUI used UE4Config for this; the file is a two-key ini, so it is parsed inline
+    /// rather than pulling the package into the headless host.
+    /// </summary>
+    private async Task<string> GetTocPathAsync()
+    {
+        var onDemandPath = Path.GetFullPath(Path.Combine(Config.ArchiveDirectory, "..", "..", "..", "Cloud", "IoStoreOnDemand.ini"));
+        if (!File.Exists(onDemandPath))
+        {
+            Log.Information("No on-demand ini at {Path}", onDemandPath);
+            return string.Empty;
+        }
+
+        var section = string.Empty;
+        foreach (var rawLine in await File.ReadAllLinesAsync(onDemandPath))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith(';') || line.StartsWith('#')) continue;
+
+            if (line.StartsWith('[') && line.EndsWith(']'))
+            {
+                section = line[1..^1].Trim();
+                continue;
+            }
+
+            if (!section.Equals("Endpoint", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var separator = line.IndexOf('=');
+            if (separator < 0) continue;
+
+            if (!line[..separator].Trim().Equals("TocPath", StringComparison.OrdinalIgnoreCase)) continue;
+
+            return line[(separator + 1)..].Trim().Replace("\"", string.Empty);
+        }
+
+        return string.Empty;
+    }
+
+    private static async Task DownloadFileAsync(string url, string destination)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+        await using var stream = await client.GetStreamAsync(url);
+        await using var fileStream = File.Create(destination);
+        await stream.CopyToAsync(fileStream);
     }
 
     private async Task LoadKeys()

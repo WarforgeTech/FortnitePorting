@@ -27,6 +27,21 @@ public class McpConfig
 
     public ELanguage Language { get; set; } = ELanguage.English;
 
+    /// <summary>
+    /// Mount Fortnite's IoStore on-demand containers so streamed textures resolve at full
+    /// resolution. Cosmetic and weapon textures ship in the local paks with only their lowest mip
+    /// (a 64x64 stub); the higher mips live on Epic's CDN and are only reachable through the
+    /// on-demand tocs. TRUE by default, matching the GUI's installation profile. Turning it off
+    /// makes the load fully offline at the cost of 64x64 weapon/cosmetic textures.
+    /// </summary>
+    public bool UseTextureStreaming { get; set; } = true;
+
+    /// <summary>Seconds allowed for a single on-demand chunk request before it is abandoned.</summary>
+    public int ChunkRequestTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>Days an on-demand chunk stays in the cache before the next load sweeps it.</summary>
+    public int ChunkCacheLifetimeDays { get; set; } = 7;
+
     public static string DefaultArchiveDirectory =>
         Path.Combine("C:", "Program Files", "Epic Games", "Fortnite", "FortniteGame", "Content", "Paks");
 
@@ -45,6 +60,13 @@ public class McpConfig
     /// <summary>Scratch folder for extracted native dependencies (binkadec/radadec/vgmstream/Detex).</summary>
     [JsonIgnore]
     public DirectoryInfo DependencyFolder => new(Path.Combine(DataDirectory, ".data"));
+
+    /// <summary>
+    /// Downloaded on-demand tocs and the CDN chunk cache. The GUI called this the cache folder and
+    /// swept it on a lifetime; the same sweep runs here so a stale chunk cannot pin an old build.
+    /// </summary>
+    [JsonIgnore]
+    public DirectoryInfo CacheFolder => new(Path.Combine(DataDirectory, "Cache"));
 
     private static readonly JsonSerializerOptions SerializerOptions = new()
     {
@@ -95,6 +117,10 @@ public class McpConfig
         ExportFolder.Create();
         LogFolder.Create();
         DependencyFolder.Create();
+        CacheFolder.Create();
+
+        if (ChunkRequestTimeoutSeconds <= 0) ChunkRequestTimeoutSeconds = 30;
+        if (ChunkCacheLifetimeDays <= 0) ChunkCacheLifetimeDays = 7;
     }
 
     public static string? GetArgumentValue(string[] args, string name)

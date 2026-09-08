@@ -926,3 +926,94 @@ say the same thing twice.
   and will still match a grep. Filtering them out would hide assets that a later season may expose
   again; flagging them is the more useful of the two, but a consumer that ignores `reach` will
   cheerfully try to place something that cannot be placed.
+
+---
+
+# On-demand texture streaming (streamed mips for cosmetics and weapons)
+
+Archive FN 42.10 local, `--call` harness, `dotnet publish -c Release`.
+
+## Symptom
+
+Weapon and cosmetic exports came out with 64x64 textures while environment props exported at 1-2K.
+Fortnite's cosmetic/weapon textures are IoStore **on-demand**: the installed paks carry only the
+lowest mip and every mip above it lives on Epic's CDN, reachable only through an on-demand toc. The
+GUI mounts those tocs in its `InitializeTextureStreaming` stage; the initial headless port dropped
+that stage, the `OnDemandOptions` on the provider, and the Epic authentication behind it. Nothing
+reported the loss — the export succeeded, the manifest looked normal, and the textures were stubs.
+
+## What was ported
+
+* `Core/EpicGamesApi.cs` — headless port of the GUI's `EpicGamesAPI`, trimmed to the bearer token
+  the chunk CDN needs. Same public launcher basic token, same client-credentials grant, same
+  verify-then-mint flow as `VerifyAuthAsync()`. The token is cached as `epic_auth.json` in the data
+  directory with its `expires_at`, replacing the GUI's `AppSettings.Application.EpicAuth`.
+* `HeadlessLoader` — three new stages. **Authenticating with Epic** runs *before* the provider
+  setup, because `OnDemandOptions` captures the bearer at construction and the provider registers
+  the local `.uondemandtoc` files (which immediately pull their container tocs) the moment it
+  initializes. **Removing Outdated Cache Files** is the GUI's chunk-cache sweep. **Loading Texture
+  Streaming** sits between Initializing Provider and Submitting Keys, exactly where the GUI has it.
+* `OnDemandOptions` on the provider: chunk host `https://egdownload.fastly-edge.com/`, chunk cache
+  `<DataDirectory>\Cache`, `Bearer` = the Epic token, timeout from config. `LoadOnDemandTocs` is now
+  `UseTextureStreaming && token != null` instead of the hard `false` the port shipped with.
+* `GetTocPathAsync` — reads `[Endpoint] TocPath` from `Cloud\IoStoreOnDemand.ini` three levels above
+  the Paks folder and downloads that toc into the cache folder. The GUI used UE4Config for this; the
+  file is a two-key ini, so it is parsed inline rather than adding the package to the headless host.
+* `McpConfig` — `UseTextureStreaming` (**default true**, matching the GUI installation profile),
+  `ChunkRequestTimeoutSeconds` (30), `ChunkCacheLifetimeDays` (7), and a `CacheFolder`.
+* `get_status` — new `textureStreaming: { enabled, mounted, authenticated, containers, tocPath?,
+  error? }` block.
+
+Fault tolerance: every step is non-fatal. No token, no ini, a failed download, a failed mount — each
+logs a warning, records the reason on `textureStreaming.error`, and the load continues at low mips.
+The load never fails because streaming did.
+
+## Results
+
+Textures measured with PIL (`Image.open(p).size`).
+
+| asset | texture | before | after |
+| --- | --- | --- | --- |
+| `WID_Assault_AutoHigh_Athena_R_Ore_T03` | `T_SCAR_D.png` | 64x64 (5.7 KB) | **1024x1024** (347 KB) |
+| | `T_SCAR_N.png` | 64x64 | **1024x1024** |
+| | `T_SCAR_S.png` | 64x64 | **1024x1024** |
+| | `T_Scar_CM.png` | 64x64 (6.3 KB) | **2048x2048** (2.05 MB) |
+| `Pickaxe_ID_732_ShovelMale` | `T_Pickaxe_Shovel_Male_D.png` | 64x64 | **1024x1024** |
+| | `T_Pickaxe_Shovel_Male_N/_S.png` | 64x64 | **1024x1024** |
+| `SM_Airborne_Sandbag_A` (prop, regression check) | `T_Airborne_Sandbag_A_A/B_D/N/S.png` | 1024x1024 | 1024x1024 (unchanged) |
+
+`get_status` on this install reports `{ enabled: true, mounted: true, authenticated: true,
+containers: 15 }`.
+
+## Mount time
+
+Same machine, same archive, `--selftest`, best of two consecutive runs each:
+
+| configuration | archive load |
+| --- | --- |
+| `UseTextureStreaming: false` (the old behaviour) | 4.2 s |
+| streaming on, chunk cache warm | 5.3 s |
+| streaming on, chunk cache emptied first | 10.0 s |
+
+So roughly **+1.1 s** on a warm cache and **+5.8 s** once, the first time a build's container tocs
+are fetched. The cache lives in `<DataDirectory>\Cache` and is swept on a 7-day lifetime.
+
+## Notes and remaining limits
+
+* **This install has no `Cloud\IoStoreOnDemand.ini`** — only `cloudcontent.json`. The ini branch
+  therefore logs "No on-demand ini" and skips; all 15 containers come from the `.uondemandtoc` files
+  already in the Paks folder (`global`, `pakchunk100fatiad`, `pakchunk100iad`, plus the
+  `*ondemand-WindowsClient` tocs). The ini path is ported and exercised up to the "file missing"
+  branch, but its download+register leg is **not** covered by this run.
+* **Streaming needs the network and Epic's OAuth endpoint.** Offline, the load still succeeds and
+  every cosmetic/weapon texture is a 64x64 stub again — visible as `textureStreaming.mounted: false`
+  in `get_status`, and that is the only signal, since the export itself still reports `status: ok`.
+* **Genuinely small textures stay small.** `T_MidgreysRGB` (128x128) and
+  `T_Quest_TinfoilLoudspeaker_A_A_E` (64x64) in the sandbag export are their real sizes, not stubs.
+  A 64x64 result is therefore not by itself proof that streaming failed.
+* **Only textures were checked.** Whether on-demand mounting also changes mesh LODs or audio was not
+  measured.
+
+## Build and publish
+
+`--selftest` PASSED (5.4 s, 12 tools). `dotnet publish -c Release` clean.

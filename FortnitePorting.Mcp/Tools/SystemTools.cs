@@ -53,7 +53,10 @@ public static class SystemTools
             },
             // False means the unmanaged ACL decoder did not load, and every animation export
             // (all emotes, lobby poses) will come out without its .ueanim.
-            ["nativeAnimationSupport"] = ExportRunner.NativeAnimationSupport
+            ["nativeAnimationSupport"] = ExportRunner.NativeAnimationSupport,
+            // enabled-but-not-mounted is the quiet failure that matters: cosmetic and weapon
+            // textures then export as their 64x64 stub mip with no error anywhere in the result.
+            ["textureStreaming"] = TextureStreamingPayload(loader)
         };
 
         if (state is LoadState.Failed failed)
@@ -87,6 +90,29 @@ public static class SystemTools
         }
 
         return ToolResults.Structured(payload);
+    }
+
+    /// <summary>
+    /// State of the IoStore on-demand mount that supplies high-resolution mips for cosmetic and
+    /// weapon textures. <c>mounted:false</c> with <c>enabled:true</c> means those textures will
+    /// come out at 64x64 - environment props are unaffected because their mips are local.
+    /// </summary>
+    private static JsonObject TextureStreamingPayload(HeadlessLoader loader)
+    {
+        var streaming = loader.TextureStreaming;
+
+        var payload = new JsonObject
+        {
+            ["enabled"] = streaming.Enabled,
+            ["mounted"] = streaming.Mounted,
+            ["authenticated"] = streaming.Authenticated,
+            ["containers"] = streaming.MountedContainers
+        };
+
+        if (streaming.TocPath is { } tocPath) payload["tocPath"] = tocPath;
+        if (streaming.Error is { } error) payload["error"] = error;
+
+        return payload;
     }
 
     /// <summary>
