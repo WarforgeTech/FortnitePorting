@@ -1113,3 +1113,133 @@ each asset's `outputRoot` its own folder (`_perassettest\Artemis_Airborne_Sandba
 Published to a staging directory and copied into both `publish\mcp` trees; the live `fortnite-assets`
 processes hold the exe open, so the running image is renamed to `.exe.old` and the new one copied
 into the freed name (Windows permits renaming a mapped image), then the `.old` swept.
+
+---
+
+# Sidekick animations (`includeAnimations`) — 2026-10-02
+
+Server: `FortnitePorting.Mcp` Release build (then `publish\mcp`), archive FN 42.x local, `--call` harness,
+`FPMCP_CONFIG=C:/Users/texas/.fortniteporting-mcp.json`. Design and usage: README §"Sidekick animations".
+
+## Symptom
+
+`export_assets` on a sidekick (`Companion_BandSoda`, "Slurp Puppy") wrote the mesh, 13 textures and a
+manifest — no animations. Raw sequence paths already converted fine; what was missing was DISCOVERY
+(companions never name their animations — they hang off ProxyTables, ChooserTables, ContextualAnim
+scene assets, variant options and the anim blueprint) and PACKAGING.
+
+## What was added
+
+* **`Core/CompanionAnimations.cs`** — `Discover()` walks the item's graph generically (CUE4Parse property
+  reflection over `FPackageIndex` / `FSoftObjectPath` / `FStructFallback` / `FInstancedStruct` / arrays /
+  sets / maps; depth cap 8, visited set; class read from package headers so leaves are never loaded just to
+  be classified) from `AnimTableAsset`, `ReactionChooserProxy`, `InteractionSceneAsset`, `MainAnimClass`
+  (class + CDO) and every `ItemVariants[]` option, then sweeps `/<Companion>/Animation/**` and
+  `/<RigFamily>/Animation/**`. `ExportAsync()` converts every hit through `AnimExport` (montage path with
+  sections/notifies, sequence path; blend spaces -> their samples) into `Animations/<Group>/`, each
+  distinct skeleton once into `Animations/Skeletons/`. `PatchManifestAsync()` adds the 2.1 fields.
+  `WarningCapture` (a Serilog sink, inert outside a capture window) recovers the reason for a failed
+  conversion, which `ExportContext` only logs.
+* **`ExportOptions.IncludeAnimations`**, wired into `ExportRunner.ExportOne` (inside the export gate, after
+  the manifest): animation files join `files[]`, failed animations join `missingArtifacts`.
+* **Tool surface**: `export_assets` / `export_gallery` `includeAnimations`; `--export-list ... --includeAnimations`;
+  per-asset `animations` summary + top-level `animationsExported` / `animationsFailed` / `animationBytes`;
+  `get_asset_info` `animationSources` + `animationDiscovery` for sidekicks.
+* **Manifest**: additive, `schemaRevision: "2.1"` (`schemaVersion` stays 2): `companionRig`,
+  `animationSources`, `animationsRoot`, `animations[]`, `skeletons[]`, `retargetAssets[]`,
+  `animationSummary`, `schemaNotes.animations`.
+
+## Results — three sidekicks, three rig families (`perAssetFolders:true, includeAnimations:true`, UEFormat)
+
+| Sidekick | Rig family (MainSkeletalMesh) | Entries (anims + blend spaces) | Exported | Failed | `.ueanim` files on disk | `.ueanim` bytes | Distinct skeletons | Anim phase (discover + export) | Call wall time (incl. ~6 s mount) |
+|---|---|---|---|---|---|---|---|---|---|
+| `Companion_BandSoda` "Slurp Puppy" (quadruped dog) | `FullSnore_Quadruped_INVIS` | 100 (97 + 3 BS) | 97 | 0 | 83 | 1,720,054 | 4 (BandSoda mesh, FullSnore family, player, emote prop) | 0.78 s + 0.93 s | 8.5 s |
+| `Companion_BamBoom` "P.A.N.D.A. Team Jr." (biped) | `RoseBruin_Biped_invis` | 77 (75 + 2 BS) | 75 | 0 | 63 | 1,305,235 | 3 (BamBoom mesh, RoseBruin family, player) | 0.72 s + 0.80 s | 8.8 s |
+| `Companion_FinFlake` "Flopsticks" (Other / floater) | `FinFlake_Other_Invis` | 79 (75 + 4 BS) | 75 | 0 | 63 | 1,560,047 | 2 (FinFlake mesh = family, player) | 0.73 s + 0.74 s | 7.8 s |
+
+"Exported" counts sequences + montages; a montage's section usually is a sequence already listed, which is
+why distinct files on disk are fewer. Per group (distinct `.ueanim` files on disk):
+
+| Sidekick | Core | Actions | AimOffsets | Reacts | Quirks | Emotes | Creative | Player | Other |
+|---|---|---|---|---|---|---|---|---|---|
+| BandSoda | 32 | 14 | 9 | 16 | 4 | 2 | 4 | 2 | 0 |
+| BamBoom | 23 | 9 | 9 | 14 | 0 | 1 | 4 | 2 | 1 (`RoseBruin_OLD_Pose_Bored_Additive`) |
+| FinFlake | 23 | 9 | 9 | 15 | 0 | 1 | 4 | 2 | 0 |
+
+By kind / source / skeleton role (manifest `animationSummary`):
+
+| Sidekick | kinds | sources | skeletonRole |
+|---|---|---|---|
+| BandSoda | sequence 40, additive 41, montage 16, blendspace 3 | animTable 45, reactionChooser 6, cas 4, variant 4, folderSweep 41 | rigFamily 90, companionMesh 7, player 2, prop 1 |
+| BamBoom | sequence 31, additive 30, montage 14, blendspace 2 | **animBlueprint 21** (this item has no `AnimTableAsset` — reached through `RoseBruin_Base_AnimBP_Child_C` CDO -> `PRT_RoseBruin_Choosers` -> `CHT_*`), reactionChooser 6, cas 4, folderSweep 46 | rigFamily 73, companionMesh 2, player 2 |
+| FinFlake | sequence 35, additive 26, montage 14, blendspace 4 | animTable 35 (`PRT_Floater_AnimTable`), reactionChooser 6, cas 4, folderSweep 34 | companionMesh 77, player 2 |
+
+Containers walked: 17 / 15 / 15. CAS emotes resolved both halves every time, e.g. `CAS_BandSoda_Emote` ->
+`BandSoda_Emote_M` (role char_b = PrimaryRole, on `BandSoda_Quadruped_Skeleton`) and
+`Player_Emote_AdditivewNotify` (char_a, `playerSide:true`, on `Fortnite_M_Avg_Player_Skeleton`, grouped
+`Player/`). The BandSoda emote's SpawnProp notify brought `BandSoda_Emote_Prop_AS.ueanim` +
+`SKM_BandSoda_Gadget.uemodel` along as `extraFiles`. Blend spaces list their samples, e.g. `FullSnore_AO`
+-> 9 `FullSnore_AO_*` sequences at (yaw, pitch) in {-90, 0, 90} x {-100, 0, 100}.
+
+## File-level verification
+
+A UEFormat reader written from `Dependencies/UEFormat/docs` (header, ZSTD body, `METADATA`, `TRACKS`; for
+skeletons `SKELETON/BONES`) opened **every** distinct `.ueanim`: **BandSoda 83/83, BamBoom 63/63, FinFlake
+63/63 OK** — magic `UEFORMAT`, identifier `UEANIM`, non-trivial size (856 B two-frame additive poses up to
+195,282 B for the 191-frame BandSoda emote), and **every track's bone name is present in the skeleton
+`.uemodel` the manifest names as its `skeletonFile`** (e.g. `FullSnore_COR_Loco_Walk`: 111/111 tracks in
+`FullSnore_Quadruped_Skeleton`; `BandSoda_Emote`: 106/106 in `BandSoda_Quadruped_Skeleton`;
+`Player_Interact_BandSoda_Petting`: 280/280 in `Fortnite_M_Avg_Player_Skeleton`).
+
+Rig compatibility, measured from the skeleton files: `FullSnore_Quadruped_Skeleton` (111 bones) vs the
+visible `BandSoda_Quadruped_Skeleton` (106) share 100 bone names, but only 42 of those have the same rest
+translation (max delta 14.4 cm, mean 3.3 cm). `RoseBruin_Biped_Skeleton` (101) vs `BamBoom_Biped_Skeleton`
+(103): 94 shared, 33 identical (max 11.6 cm). The family library is name-compatible with the visible mesh
+but not proportion-compatible — retarget, or apply rotations only.
+
+Additives: 97 additive sequences across the three (`AAT_LocalSpaceBase` 70, `AAT_RotationOffsetMeshSpace`
+27; ref pose `ABPT_AnimFrame` 96, `ABPT_AnimScaled` 1), every one with `RefPoseSeq` stripped by cooking, so
+none could be baked onto a base pose (`bakedOntoBasePose:false`); exported as stored deltas and flagged.
+
+## Formats
+
+| meshFormat | Result (FinFlake) |
+|---|---|
+| UEFormat | 63 `.ueanim` (1,560,047 B) + `.uemodel` skeletons |
+| Gltf2 | mesh `.glb`. First attempt wrote `.ueanim`s with **no** skeleton (`glTF does not support skeleton-only exports`). Fixed: the animation phase writes UEFormat for Gltf2 and says so in `animations.notes` -> 63 `.ueanim` + 2 `.uemodel` skeletons, `skeletonFilesMissing: 0`. |
+| ActorX | 63 `.psa` (17,394,864 B, uncompressed) + `.pskx` skeletons. First attempt mis-filed the `.pskx` as an extra file and reported 75 missing skeletons — fixed (ActorX skeleton-only files are `.pskx`); re-run `skeletonFilesMissing: 0`. |
+
+## Negative control, regression, other paths
+
+* **`includeAnimations:false` is byte-identical**: BandSoda exported by the previously published exe
+  (commit 36d37514) and by the new build — same 15 files, all 14 mesh/texture files identical by MD5;
+  `manifest.json` same size, differing only in `generator`, `generatedUtc` and the absolute output paths.
+* **Regression**: Prop `PPID_CRP_CondoCanyon_Artemis_Airborne_Sandbag_A` + Emote `EID_Floss` through the
+  old exe and the new build (the latter with `includeAnimations:true`, which must be inert for
+  non-sidekicks): both `status ok`, 2 assets, 15 files, 4,818,781 B, identical file sets and sizes; neither
+  asset gained an `animations` block.
+* **`get_asset_info`** (headers only, nothing decoded): BandSoda `animationsDiscovered: 100` (AnimSequence
+  81, AnimMontage 16, BlendSpace1D 2, AimOffsetBlendSpace 1; 59 graph + 41 sweep), 1.0 s discovery / 1.4 s
+  call; BamBoom 77, 0.6 s / 1.0 s — exactly the export's entry counts.
+* **`--export-list ... --includeAnimations`** (WideSnore "Doggo Jr." + a prop): `2 ok`; sidekick 97 files
+  (86 animations, 0 failed, 1,404,165 B), prop unchanged at 11 files; 9.3 s wall for the process.
+* **Re-export into the same folder**: identical counts (97 exported / 0 failed / 83 files / 1,720,054 B) —
+  skeletons skipped as existing, group files overwritten.
+* **Flat `outputDir`** (no `perAssetFolders`): animations go to `Companion_FinFlake_Animations/` so two
+  sidekicks sharing one folder cannot collide; 75 exported, 0 failed.
+* `--selftest` PASSED (5.6 s, 12 tools).
+
+## Limitations
+
+* **Most animations are on the rig-family skeleton, not the visible mesh** (`skeletonRole: rigFamily`).
+  Only the sidekick's own emote and quirk poses (and everything, for a sidekick that is its own family
+  like Flopsticks) play directly on the exported mesh. `RTG_*` / `IK_*` retarget assets are listed, not converted.
+* **Blend spaces / aim offsets** are reported as structure (`samples[]`) — there is no blend-space file
+  format; their samples are exported individually.
+* **AnimBP-driven procedural layers** (IK, dynamics bones such as BandSoda's `dyn_*_blob`, post-process
+  anim blueprints, layered blending, curve-driven poses) are not animation assets and are not reproduced.
+* **Additives are deltas** (above). Montage notifies other than emote sounds / spawned props are dropped.
+* **Not exercised**: a real conversion failure — none of the conversions in these runs failed, so the
+  animation `missingArtifacts` path is covered by code review, not by a measured failure.
+* Proxy assets whose value lives in a table the item cannot reach (e.g. `PRA_Quadruped_Small_CreativeReactions`)
+  are not resolved through the graph; the rig-family folder sweep is what picks those creative reactions up.

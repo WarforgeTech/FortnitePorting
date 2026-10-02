@@ -556,6 +556,10 @@ public static class DiscoveryTools
         // Character parts (outfits, backpacks, pets, companions) -----------------
         AddCharacterParts(payload, asset);
 
+        // Sidekick animation graph (lazy: containers are opened, animations are counted, never converted)
+        if (asset.ExportType.Equals("CosmeticCompanionItemDefinition", StringComparison.OrdinalIgnoreCase))
+            AddAnimationSources(payload, loader, asset);
+
         return ToolResults.Structured(payload);
     }
 
@@ -839,6 +843,66 @@ public static class DiscoveryTools
     /// (BaseCharacterParts, else the HeroDefinition specialization fallback). Surfaces body type /
     /// gender and flags any part that carries no mesh - the one case where an export comes out short.
     /// </summary>
+    /// <summary>
+    /// Where a sidekick's animations come from, and how many there are, without converting any: the anim
+    /// table / chooser / CAS containers are walked for references (class read from package headers), and
+    /// the folder sweep is a path count only. export_assets with includeAnimations:true does the real work.
+    /// </summary>
+    private static void AddAnimationSources(JsonObject payload, HeadlessLoader loader, UObject asset)
+    {
+        try
+        {
+            var discovery = CompanionAnimations.Discover(asset, loader.Provider, includeFolderSweep: true, classifySweep: true);
+
+            payload["animationSources"] = new JsonArray(discovery.Sources.Select(source => (JsonNode) new JsonObject
+            {
+                ["property"] = source.Property,
+                ["objectPath"] = source.ObjectPath,
+                ["class"] = source.ClassName,
+                ["source"] = source.Source
+            }).ToArray());
+
+            var bySource = new JsonObject();
+            foreach (var group in discovery.Animations.GroupBy(anim => anim.Source).OrderBy(group => group.Key))
+                bySource[group.Key] = group.Count();
+
+            payload["animationDiscovery"] = new JsonObject
+            {
+                ["graphReferences"] = discovery.GraphReferenceCount,
+                ["graphReferencesBySource"] = bySource,
+                ["playerSideReferences"] = discovery.Animations.Count(anim => anim.PlayerSide),
+                ["folderSweepFilesScanned"] = discovery.FolderSweepFiles,
+                ["folderSweepAnimations"] = discovery.Animations.Count - discovery.GraphReferenceCount,
+                ["animationsDiscovered"] = discovery.Animations.Count,
+                ["byClass"] = ByClass(discovery),
+                ["containersWalked"] = discovery.ContainersVisited.Count,
+                ["sweepPatterns"] = ToolResults.ToJsonArray(discovery.SweepPatterns),
+                ["mainSkeletalMesh"] = discovery.MainSkeletalMesh,
+                ["mainAnimClass"] = discovery.MainAnimClass,
+                ["rigFamily"] = discovery.FamilyName,
+                ["retargetAssets"] = ToolResults.ToJsonArray(discovery.RetargetAssets),
+                ["seconds"] = Math.Round(discovery.Seconds, 2),
+                ["note"] = "Counts references, not conversions: containers are opened and every candidate's class is read from "
+                           + "its package header, but no animation is decoded. animationsDiscovered is exactly the set export_assets "
+                           + "{includeAnimations:true, perAssetFolders:true} will attempt (blend spaces additionally expand to their "
+                           + "sample sequences at export time; montage sections usually coincide with sequences already listed)."
+            };
+        }
+        catch (Exception e)
+        {
+            Log.Debug("Animation discovery failed for {Name}: {Message}", asset.Name, e.Message);
+            payload["animationDiscovery"] = new JsonObject { ["error"] = e.Message };
+        }
+    }
+
+    private static JsonObject ByClass(CompanionAnimDiscovery discovery)
+    {
+        var json = new JsonObject();
+        foreach (var group in discovery.Animations.GroupBy(anim => anim.ClassName ?? "unknown").OrderBy(group => group.Key))
+            json[group.Key] = group.Count();
+        return json;
+    }
+
     private static void AddCharacterParts(JsonObject payload, UObject asset)
     {
         CharacterPartSet set;

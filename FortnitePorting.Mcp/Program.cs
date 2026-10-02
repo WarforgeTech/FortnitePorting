@@ -321,7 +321,7 @@ internal static class CliModes
     public static async Task<int> ExportListAsync(McpConfig config, string[] args)
     {
         const string usage = "Usage: --export-list <list.json> <outputDir> [--meshFormat UEFormat|ActorX|Gltf2] "
-                             + "[--imageFormat PNG|TGA] [--styles all|{\"Style\":\"...\"}] [--resume]";
+                             + "[--imageFormat PNG|TGA] [--styles all|{\"Style\":\"...\"}] [--resume] [--includeAnimations]";
 
         var index = Array.FindIndex(args, arg => arg.Equals("--export-list", StringComparison.OrdinalIgnoreCase));
         var listPath = Positional(args, index + 1);
@@ -372,7 +372,8 @@ internal static class CliModes
             MeshFormat = meshFormat,
             ImageFormat = imageFormat,
             Styles = styles,
-            Resume = args.Contains("--resume", StringComparer.OrdinalIgnoreCase)
+            Resume = args.Contains("--resume", StringComparer.OrdinalIgnoreCase),
+            IncludeAnimations = args.Contains("--includeAnimations", StringComparer.OrdinalIgnoreCase)
         };
 
         List<ExportListItem> preview;

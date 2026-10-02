@@ -83,14 +83,14 @@ claude mcp add fortnite-assets --scope user `
 | `list_categories` | Every browsable category and its asset-registry row count. Gives the `category` values the other tools accept. |
 | `search_assets` | Fast registry search over asset name, package path **and** in-game display name. Never opens a `.uasset`. |
 | `browse_category` | Pages through one category, opening each asset for its real display name, description and gameplay tags. |
-| `get_asset_info` | Full detail for one asset: display name, description, rarity/series/set, tags, icon textures, style channels, export type. |
+| `get_asset_info` | Full detail for one asset: display name, description, rarity/series/set, tags, icon textures, style channels, export type. For a sidekick also `animationSources` and `animationDiscovery` (how many animations an `includeAnimations` export will attempt - counted, not converted). |
 | `search_files` | Searches the mounted virtual file system by path — meshes, sounds, maps, textures, animations that have no item definition. |
 | `get_asset_icon` | One asset's icon as a PNG, at the requested size. |
 | `make_contact_sheet` | Composites up to 60 candidates into one numbered grid image plus a legend mapping cells back to object paths. |
 | `list_asset_styles` | The style/variant channels and options an asset exposes. |
 | `get_properties_json` | The raw deserialised properties of an asset, for when the structured tools are not enough. |
-| `export_assets` | Exports one or more object paths to disk (mesh + materials + textures + sounds). |
-| `export_gallery` | Exports a Creative gallery/prefab, either as per-prop folders (default) or as one composed prefab. |
+| `export_assets` | Exports one or more object paths to disk (mesh + materials + textures + sounds). `includeAnimations: true` adds a sidekick's whole animation set - see [Sidekick animations](#sidekick-animations-includeanimations). |
+| `export_gallery` | Exports a Creative gallery/prefab, either as per-prop folders (default) or as one composed prefab. Also takes `includeAnimations`. |
 
 ## Intended agent workflow
 
@@ -199,6 +199,7 @@ FortnitePorting.Mcp.exe --export-list kitbash.json D:\Kitbash --meshFormat Gltf2
 | `--imageFormat` | `PNG` (default) or `TGA`. |
 | `--styles` | `all`, or a channel→option object like `{"Style":"Black & Gold"}` — same union `export_assets` takes. |
 | `--resume` | Skip any entry whose folder already holds a `manifest.json`. |
+| `--includeAnimations` | Sidekick entries also export their animation set (same as the `export_assets` option). |
 
 The list is a JSON array; only `objectPath` is required.
 
@@ -252,6 +253,94 @@ the folders the first one created. Entries that *failed* are retried, not skippe
 
 ---
 
+## Sidekick animations (`includeAnimations`)
+
+A sidekick (`CosmeticCompanionItemDefinition`, category `Sidekick`) exports its visible mesh like any
+cosmetic. Its animations are not named by the item at all - they hang off a small object graph - so
+`export_assets {objectPaths:[...], outputDir, perAssetFolders:true, includeAnimations:true}` adds a
+discovery + export phase after the mesh (`Core/CompanionAnimations.cs`).
+
+**Discovery** walks the real object graph through CUE4Parse property reflection - `FPackageIndex`,
+`FSoftObjectPath`, `FStructFallback`, `FInstancedStruct`, arrays, sets and maps, read generically with no
+per-class schema, a depth cap of 8 and a visited set:
+
+| Root | What it is | Yields |
+|---|---|---|
+| `AnimTableAsset` | `ProxyTable` (`PRT_<Companion>_AnimTable`) | `RuntimeValues[].Value{Asset}` sequences / blend spaces, `{Chooser}` -> `ChooserTable`s (walked) |
+| `ReactionChooserProxy` | `ProxyTable` -> `ChooserTable` | the reaction montages (`*_RCT_*_M`) |
+| `InteractionSceneAsset` | `ContextualAnimSceneAsset` | petting/hi-five montages for BOTH roles |
+| `ItemVariants[]` | `ContextualAnimSceneEmote` (CAS) / `AdditivePoseAnim` | the sidekick emote montage + the player's montage; quirk poses |
+| `MainAnimClass` | `AnimBlueprintGeneratedClass` (class + CDO properties) | tables/anims the anim blueprint references - P.A.N.D.A. Team Jr. has no `AnimTableAsset`, its 21 table-driven anims come from here |
+| folder sweep | `/<Companion>/Animation/**` and `/<RigFamily>/Animation/**` anywhere in the VFS | the rest of the shared rig library, incl. CreativeCompanion `/<Family>/Animation/UEFN/` creative reactions |
+
+The rig family is the prefix of `MainSkeletalMesh` (`FullSnore_Quadruped_INVIS` -> `FullSnore`). The
+family's own `Animation/Emotes/` is skipped (another companion's emotes). Everything is deduped by
+mount-relative package path; class is read from the package header, so non-animation assets in those
+folders (choosers, proxy assets, sounds) are never opened. CAS tracks carry their `Role`; a track whose
+role is not the CAS `PrimaryRole` (or whose path is under `/Player/`) is `playerSide`.
+
+**Layout** (beside the manifest; `<AssetName>_Animations` instead of `Animations` when several assets
+share one flat folder):
+
+```
+<Display Name>/
+  BandSoda_Quadruped.uemodel, textures..., manifest.json
+  Animations/
+    Skeletons/   one .uemodel per DISTINCT skeleton (companion mesh, rig family, player, emote props)
+    Core/ Actions/ AimOffsets/ Reacts/ Quirks/ Emotes/ Creative/ Player/ Other/   <Name>.ueanim
+```
+
+Group comes from the path segment after `/Animation/` (`UEFN`/CreativeCompanion -> `Creative`; player-side
+-> `Player`), falling back to name tokens (`_COR_`, `_ACT_`, `_AO_`, `_RCT_`, `_QRK_`). Montages go through
+`AnimExport`'s montage path (sections + notifies - notify sounds and spawned prop meshes land beside the
+montage as `extraFiles`), sequences through its sequence path. A blend space has no file of its own: its
+`samples[]` (sample value + sequence) are listed and each sample sequence is exported as its own entry.
+
+**Formats.** Animations follow `meshFormat`: UEFormat -> `.ueanim` + `.uemodel` skeletons; ActorX ->
+`.psa` + `.pskx` skeletons. glTF cannot hold a skeleton-only file and the glb writer carries no animation,
+so with `Gltf2` the companion mesh is still `.glb` but the animation phase writes UEFormat and says so in
+`animations.notes`.
+
+**Manifest** (additive - `schemaVersion` stays 2, `schemaRevision: "2.1"`): `companionRig`
+(`mainSkeletalMesh`, `mainAnimClass`, `baseRigSkeleton`, `companionMeshSkeleton`, `rigFamily`),
+`animationSources[]`, `animationsRoot`, `animations[]` (`name, objectPath, class, file, files?, group,
+kind: sequence|montage|additive|blendspace, skeleton, skeletonFile, skeletonRole, lengthSeconds,
+frameCount, source: animTable|reactionChooser|cas|variant|animBlueprint|folderSweep|blendSpaceSample, via,
+playerSide, casRole?, additive?, sections?, samples?, extraFiles?, status, error?`), `skeletons[]`
+(`role, boneCount, animationsUsing, bonesSharedWithCompanionMesh`), `retargetAssets[]` (RTG_/IK_ paths,
+informational) and `animationSummary`. The tool result carries the same summary per asset plus
+`animationsExported` / `animationsFailed` (with reasons) at the top level.
+
+**Honesty.** A resolved animation that writes no file is a `missingArtifacts` entry on the asset (so the
+export is `partial` and listed in `failures`), with the reason recovered from the converter's warning
+(ExportContext only logs it). A skeleton that did not write is `skeletonError` on the entry and counted in
+`skeletonFilesMissing`. `includeAnimations:false` (the default) leaves the export exactly as before.
+
+**Which skeleton are the animations on?** Mostly NOT the visible mesh. Each animation stays on the
+skeleton it was authored for, reported as `skeletonRole`:
+
+* `companionMesh` - plays directly on the exported mesh (the sidekick's own emote, quirk poses, and - for
+  sidekicks that are their own rig family, e.g. Flopsticks - everything).
+* `rigFamily` - the shared library (locomotion, actions, aim offsets, reacts, creative) authored on the
+  family skeleton, e.g. `FullSnore_Quadruped_Skeleton` for every FullSnore-rig dog. Bone NAMES largely
+  match the visible mesh (`bonesSharedWithCompanionMesh`, e.g. 100 of BandSoda's 106) but proportions do
+  not (58 of those 100 bones have a different rest translation). The anim blueprint runs on the invisible
+  base rig (`companionRig.mainSkeletalMesh`), and the companion folder ships `RTG_<Companion>` / `IK_<Companion>`
+  retarget assets (`retargetAssets`) - Fortnite's own bridge to the visible mesh; those assets are listed,
+  not converted. To play the family animations on the visible mesh: retarget
+  (UE IK Retargeter from the family skeleton to the companion skeleton), or in Blender import the
+  `.ueanim` onto the family skeleton `.uemodel` from `Animations/Skeletons/` - or apply by bone name
+  using rotations only.
+* `player` - `Fortnite_M_Avg_Player_Skeleton`: the player half of a CAS emote/interaction (`playerSide`).
+* `prop` - an emote prop's own skeleton (e.g. `SK_BandSoda_Gadget`).
+
+Additive sequences (`kind: additive`, all `_ADD` / `_AO_` / quirk poses) are exported as stored and
+flagged: cooked Fortnite strips `RefPoseSeq`, so CUE4Parse cannot bake them onto a base pose
+(`additive.bakedOntoBasePose: false`) and the `.ueanim` carries additive deltas with the additive type in
+its metadata - layer them over a base pose (e.g. `*_COR_Base_Pose`) rather than playing them alone.
+
+---
+
 ## Command-line modes
 
 Besides the default stdio server, the same exe carries its development harness:
@@ -261,7 +350,7 @@ Besides the default stdio server, the same exe carries its development harness:
 | `--tools` | Lists every registered tool with its input schema. |
 | `--call <tool> '<jsonArgs>'` | Invokes one tool in-process, prints the JSON, writes any images to `<DataDirectory>\call_output`. |
 | `--selftest` | End-to-end smoke: mount the archive, check the registry, extract the native dependencies, decode one icon, discover the tools. |
-| `--export-list <list.json> <outputDir> [--meshFormat …] [--imageFormat …] [--styles …] [--resume]` | Bulk export for kitbash lists: one archive mount, per-asset folders, resumable, `export_report.json`. See above. |
+| `--export-list <list.json> <outputDir> [--meshFormat …] [--imageFormat …] [--styles …] [--resume] [--includeAnimations]` | Bulk export for kitbash lists: one archive mount, per-asset folders, resumable, `export_report.json`. See above. |
 | `--nameindex [--category <Name>]` | Builds the display-name index in the foreground with per-category timings and memory. |
 | `--iconcoverage <n> [--category <Name>]` | Samples a category through the icon resolver and reports how much real artwork (vs placeholder) it found. |
 

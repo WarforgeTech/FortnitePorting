@@ -37,6 +37,9 @@ public record ExportListOptions
 
     /// <summary>Skip any entry whose folder already holds a manifest.json.</summary>
     public bool Resume { get; init; }
+
+    /// <summary>Sidekicks: also export the companion animation set (see ExportOptions.IncludeAnimations).</summary>
+    public bool IncludeAnimations { get; init; }
 }
 
 /// <summary>Per-entry row of export_report.json.</summary>
@@ -200,7 +203,8 @@ public class ExportListRunner(HeadlessLoader loader, ExportRunner runner)
             SoundFormat = options.SoundFormat,
             ExportMaterials = options.ExportMaterials,
             Styles = options.Styles,
-            ManifestFileName = ManifestFileName
+            ManifestFileName = ManifestFileName,
+            IncludeAnimations = options.IncludeAnimations
         };
 
         // One namer per parent directory keeps "Wall" and "Wall_2" allocation deterministic, which is

@@ -67,6 +67,13 @@ public static class ExportTools
         bool exportMaterials = true,
         [Description("Outfits only: also write the lobby idle montage as a .ueanim (the FortnitePorting 'Import Lobby Poses' option). Off by default.")]
         bool importLobbyPoses = false,
+        [Description("Sidekicks (companions): also discover and export the companion's whole animation set - anim table, reaction "
+                     + "chooser, CAS emote/interaction montages (player-side montages grouped under Player/), quirk poses, anim blueprint, "
+                     + "plus a sweep of the companion's and its shared rig family's Animation folders - into "
+                     + "<asset folder>/Animations/<Group>/<Name>.ueanim with each distinct skeleton once under Animations/Skeletons/. "
+                     + "The manifest gains animations[], skeletons[], retargetAssets[] and companionRig. Off by default (the export is "
+                     + "then exactly what it was without this option). Use with perAssetFolders=true.")]
+        bool includeAnimations = false,
         CancellationToken cancellationToken = default)
     {
         var loader = services.GetRequiredService<HeadlessLoader>();
@@ -84,7 +91,10 @@ public static class ExportTools
         if (!TryParseStyles(styles, out var styleSelection, out var styleError))
             return Failure(styleError!);
 
-        options = options with { Styles = styleSelection, ImportLobbyPoses = importLobbyPoses, PerAssetFolders = perAssetFolders };
+        options = options with
+        {
+            Styles = styleSelection, ImportLobbyPoses = importLobbyPoses, PerAssetFolders = perAssetFolders, IncludeAnimations = includeAnimations
+        };
 
         try
         {
@@ -122,6 +132,8 @@ public static class ExportTools
         string imageFormat = "PNG",
         [Description("Export materials and their textures alongside meshes.")]
         bool exportMaterials = true,
+        [Description("Also export the animation set of any member that carries a companion animation graph (sidekicks). Off by default.")]
+        bool includeAnimations = false,
         CancellationToken cancellationToken = default)
     {
         var loader = services.GetRequiredService<HeadlessLoader>();
@@ -132,6 +144,8 @@ public static class ExportTools
 
         if (!TryParseOptions(outputDir, meshFormat, imageFormat, "WAV", exportMaterials, out var options, out var optionError))
             return Failure(optionError!);
+
+        options = options with { IncludeAnimations = includeAnimations };
 
         try
         {
@@ -587,6 +601,14 @@ public static class ExportTools
                 }).ToArray())
         };
 
+        var animated = result.Assets.Where(asset => asset.Animations is not null).ToList();
+        if (animated.Count > 0)
+        {
+            json["animationsExported"] = animated.Sum(asset => asset.Animations!.Exported);
+            json["animationsFailed"] = animated.Sum(asset => asset.Animations!.Failed.Count());
+            json["animationBytes"] = animated.Sum(asset => asset.Animations!.AnimationBytes);
+        }
+
         if (incomplete > 0)
             json["note"] = $"{incomplete} asset(s) wrote files but are missing a primary artifact - see missingArtifacts on each "
                            + "and the matching entry in failures. The files that did land are valid.";
@@ -635,6 +657,29 @@ public static class ExportTools
 
         if (asset.Notes.Count > 0)
             json["notes"] = ToolResults.ToJsonArray(asset.Notes);
+
+        if (asset.Animations is { } animations)
+        {
+            var summary = CompanionAnimations.Summary(animations);
+            summary["animationsRoot"] = animations.AnimationsRoot;
+            summary["companionRig"] = new JsonObject
+            {
+                ["mainSkeletalMesh"] = animations.Discovery.MainSkeletalMesh,
+                ["mainAnimClass"] = animations.Discovery.MainAnimClass,
+                ["baseRigSkeleton"] = animations.BaseRigSkeleton,
+                ["companionMeshSkeleton"] = animations.CompanionMeshSkeleton
+            };
+            summary["failures"] = new JsonArray(animations.Failed.Select(failed => (JsonNode) new JsonObject
+            {
+                ["name"] = failed.Ref.Name,
+                ["objectPath"] = failed.Ref.ObjectPath,
+                ["kind"] = failed.Kind,
+                ["reason"] = failed.Error
+            }).ToArray());
+            json["animations"] = summary;
+            json["animationsExported"] = animations.Exported;
+            json["animationsFailed"] = animations.Failed.Count();
+        }
 
         if (asset.Parts.Count > 0)
         {

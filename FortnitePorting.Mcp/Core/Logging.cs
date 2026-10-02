@@ -21,6 +21,9 @@ public static class Logging
                 outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
             .WriteTo.File(logFile,
                 outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+            // Lets the sidekick animation phase recover the reason a conversion failed (ExportContext
+            // only logs it). Inert unless a capture window is open.
+            .WriteTo.Sink(WarningCapture.Instance)
             .CreateLogger();
 
         Log.Information("Log file: {Path}", logFile);

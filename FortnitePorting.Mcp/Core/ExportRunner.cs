@@ -62,6 +62,14 @@ public record ExportOptions
     /// handed.
     /// </summary>
     public bool PerAssetFolders { get; init; }
+
+    /// <summary>
+    /// Sidekicks (and anything else carrying a companion animation graph): after the mesh export,
+    /// discover the companion's animation set (anim table, reaction chooser, CAS emotes/interactions,
+    /// anim blueprint, folder sweep) and export it under &lt;asset folder&gt;/Animations/&lt;Group&gt;/.
+    /// See <see cref="CompanionAnimations"/>. Off by default; the base export is unchanged when off.
+    /// </summary>
+    public bool IncludeAnimations { get; init; }
 }
 
 public record ExportedFile(string Path, long Bytes);
@@ -105,6 +113,9 @@ public record ExportedAsset
 
     /// <summary>Machine-readable manifest flags (shadow_proxy_present, unreferenced_texture_files, ...).</summary>
     public List<string> ManifestNotes { get; init; } = [];
+
+    /// <summary>Animation phase result when <see cref="ExportOptions.IncludeAnimations"/> was set.</summary>
+    public CompanionAnimExport? Animations { get; init; }
 
     public long Bytes => Files.Sum(file => file.Bytes);
 }
@@ -513,6 +524,32 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                     files.Add(new ExportedFile(manifest.Path, manifest.Bytes));
             }
 
+            // Sidekick animations: discovered from the item's animation graph and exported beside the
+            // mesh. Runs inside the gate - CUE4Parse conversion keeps non-thread-safe static caches.
+            CompanionAnimExport? animations = null;
+            if (opts.IncludeAnimations && CompanionAnimations.HasAnimationGraph(asset))
+            {
+                (animations, var animationError) = await ExportAnimations(asset, opts, meta, outputRoot, manifest?.Path, displayName, token);
+                if (animationError is not null)
+                    missing.Add($"animations: includeAnimations was set but the animation phase failed - {animationError}");
+
+                if (animations is not null)
+                {
+                    foreach (var file in animations.Files)
+                        if (files.All(existing => !existing.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase)))
+                            files.Add(file);
+
+                    foreach (var failed in animations.Failed)
+                        missing.Add($"animation: \"{failed.Ref.Name}\" ({failed.Ref.ObjectPath}) was resolved but did not export - {failed.Error}");
+
+                    if (manifest is not null && await CompanionAnimations.PatchManifestAsync(manifest.Path, animations) is { } manifestBytes)
+                    {
+                        var index = files.FindIndex(file => file.Path.Equals(manifest.Path, StringComparison.OrdinalIgnoreCase));
+                        if (index >= 0) files[index] = new ExportedFile(manifest.Path, manifestBytes);
+                    }
+                }
+            }
+
             return new SingleExport(new ExportedAsset
             {
                 ObjectPath = asset.GetPathName(),
@@ -527,7 +564,8 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
                 ManifestPath = manifest?.Path,
                 PrimaryMeshFile = manifest?.PrimaryMeshFile,
                 PrimaryMeshPath = manifest?.PrimaryMeshPath,
-                ManifestNotes = manifest?.Notes ?? []
+                ManifestNotes = manifest?.Notes ?? [],
+                Animations = animations
             }, null);
         }
         catch (Exception e)
@@ -537,6 +575,40 @@ public class ExportRunner(HeadlessLoader loader, HeadlessExportAssetProvider exp
         finally
         {
             _exportGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// The animation phase of a sidekick export. Animations land in "Animations" beside the manifest when
+    /// the asset owns its folder (perAssetFolders / gallery / export-list), otherwise in
+    /// "&lt;AssetName&gt;_Animations" so two companions sharing one flat folder cannot collide.
+    /// </summary>
+    private async Task<(CompanionAnimExport? Result, string? Error)> ExportAnimations(
+        UObject asset, ExportOptions opts, ExportDataMeta meta, string outputRoot, string? manifestPath, string displayName, CancellationToken token)
+    {
+        try
+        {
+            var discovery = CompanionAnimations.Discover(asset, loader.Provider, includeFolderSweep: true, classifySweep: true);
+            Log.Information("Sidekick {Name}: discovered {Count} animation(s) in {Seconds:N1}s ({Graph} from the graph, {Containers} containers walked)",
+                displayName, discovery.Animations.Count, discovery.Seconds, discovery.GraphReferenceCount, discovery.ContainersVisited.Count);
+
+            var baseDir = manifestPath is not null ? IoPath.GetDirectoryName(manifestPath)! : outputRoot;
+            var ownsFolder = opts.ManifestFileName is "manifest.json";
+            var animationsRoot = IoPath.Combine(baseDir, ownsFolder ? "Animations" : $"{SanitizeFileName(asset.Name)}_Animations");
+
+            var result = await CompanionAnimations.ExportAsync(asset, discovery, meta.Settings, exportProvider, animationsRoot, token);
+            Log.Information("Sidekick {Name}: {Ok} animation(s) exported, {Failed} failed, {Bytes:N0} bytes of animation in {Seconds:N1}s",
+                displayName, result.Exported, result.Failed.Count(), result.AnimationBytes, result.Seconds);
+            return (result, null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception e)
+        {
+            Log.Warning(e, "Animation export for {Name} failed", displayName);
+            return (null, Flatten(e));
         }
     }
 
