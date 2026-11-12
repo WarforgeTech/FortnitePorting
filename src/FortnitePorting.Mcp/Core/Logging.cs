@@ -1,0 +1,33 @@
+using FortnitePorting.Mcp.Config;
+using Serilog;
+using Serilog.Events;
+
+namespace FortnitePorting.Mcp.Core;
+
+public static class Logging
+{
+    /// <summary>
+    /// Configures Serilog to write to stderr and a rolling file. Nothing may ever reach
+    /// stdout: that stream is reserved for the MCP stdio transport.
+    /// </summary>
+    public static void Initialize(McpConfig config, LogEventLevel minimumLevel = LogEventLevel.Information)
+    {
+        // The process id keeps two instances started in the same second from fighting over one
+        // file (the second would silently lose its log).
+        var logFile = Path.Combine(config.LogFolder.FullName, $"FortnitePorting.Mcp-{DateTime.Now:yyyy-MM-dd-HH-mm-ss}-{Environment.ProcessId}.log");
+
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Is(minimumLevel)
+            .WriteTo.Console(
+                standardErrorFromLevel: LogEventLevel.Verbose,
+                outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+            .WriteTo.File(logFile,
+                outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+            // Lets the sidekick animation phase recover the reason a conversion failed (ExportContext
+            // only logs it). Inert unless a capture window is open.
+            .WriteTo.Sink(WarningCapture.Instance)
+            .CreateLogger();
+
+        Log.Information("Log file: {Path}", logFile);
+    }
+}
